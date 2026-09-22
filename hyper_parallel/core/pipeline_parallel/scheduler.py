@@ -2437,9 +2437,16 @@ def _next_active_stage_indices(actions, start_index, max_active_stages, managed_
     lookahead window only counts real compute, otherwise communication-only
     actions would consume the budget and shrink the effective prefetch depth.
     """
+    # A rank cannot discover more distinct stages than it locally manages.
+    # Bounding the target prevents a full tail scan for every action when the
+    # configured prefetch depth exceeds the local stage count (O(N^2)).
+    target_active_stages = min(max_active_stages, len(managed_stage_indices))
     stage_indices = []
     seen = set()
-    for action in actions[start_index:]:
+    # ``actions[start_index:]`` copies an increasingly large tail on every
+    # invocation and preserves quadratic behavior even with the bounded
+    # target. ``islice`` provides the same lookahead without copying.
+    for action in itertools.islice(actions, start_index, None):
         for leaf_step in iter_leaf_meta_steps(action):
             if leaf_step.type not in _COMPUTE_META_STEP_TYPES:
                 continue
@@ -2447,7 +2454,7 @@ def _next_active_stage_indices(actions, start_index, max_active_stages, managed_
                 continue
             seen.add(leaf_step.stage_index)
             stage_indices.append(leaf_step.stage_index)
-            if len(stage_indices) == max_active_stages:
+            if len(stage_indices) == target_active_stages:
                 return stage_indices
     return stage_indices
 
