@@ -18,6 +18,7 @@
 """enhanced with selective checkpoint support swap"""
 # pylint: disable=W0212, W0613, C0115, C0116, C0103, R1705
 from collections import defaultdict
+from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -199,8 +200,8 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
             group_swap = self.group_swap
             cpu_pool = self.cpu_pool
             entries = tree_map(
-                lambda x: _make_swap_entry(
-                    x,
+                partial(
+                    _make_swap_entry,
                     has_alias=has_alias,
                     funcname=funcname,
                     group_swap=group_swap,
