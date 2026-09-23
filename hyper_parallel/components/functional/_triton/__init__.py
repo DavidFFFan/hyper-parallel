@@ -12,14 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Qwen3.5 model-family integration."""
-
-__all__ = ["get_adapter_spec"]
-
-from typing import Any
-
-
-def get_adapter_spec() -> Any:
-    """Return the Qwen3.5 adapter specification through the shared registry."""
-    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
-    return get_model_adapter("qwen3_5")
+"""Private Triton backend implementations for high-performance functions."""
