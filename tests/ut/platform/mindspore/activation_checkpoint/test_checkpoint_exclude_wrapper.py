@@ -13,10 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """Tests for the MindSpore checkpoint exclusion wrapper."""
+import dataclasses
 import contextlib
+import gc
 import importlib
-from typing import Iterator, Tuple
+from typing import Any, Iterator, Tuple
 import unittest
+import weakref
 
 import numpy as np
 import pytest
@@ -25,12 +28,17 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (
 )
 
 ms = pytest.importorskip("mindspore")
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+
 ParameterTuple = ms.ParameterTuple
+Parameter = ms.Parameter
 Tensor = ms.Tensor
 nn = ms.nn
 ops = ms.ops
+_Function = importlib.import_module("mindspore.common._grad_function")._Function
 _pynative_executor = importlib.import_module("mindspore.graph.api")._pynative_executor
 
+enable_mindspore_backward_compat()
 ensure_mindspore_platform_default()
 
 activation_checkpoint = importlib.import_module("hyper_parallel.core.activation_checkpoint")
@@ -45,6 +53,39 @@ checkpoint_exclude_wrapper_module = importlib.import_module(
     "hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper"
 )
 CheckpointExcludeWrapper = checkpoint_exclude_wrapper_module.CheckpointExcludeWrapper
+
+
+def _pack_with_inputs(saved_tensor, args, kwargs=None):
+    """Run the exclude pack hook with storage metadata captured from inputs."""
+    kwargs = {} if kwargs is None else kwargs
+    inputs = checkpoint_exclude_wrapper_module._capture_recompute_inputs(args, kwargs)
+    bindings = []
+    state = checkpoint_exclude_wrapper_module._PackState(inputs, bindings)
+    token = checkpoint_exclude_wrapper_module._ACTIVE_PACK_STATE.set(state)
+    try:
+        packed = checkpoint_exclude_wrapper_module._pack_saved_tensor(saved_tensor)
+    finally:
+        checkpoint_exclude_wrapper_module._ACTIVE_PACK_STATE.reset(token)
+    return packed, bindings
+
+
+class _SaveExactInput(_Function):
+    """Autograd function that saves its exact input for backward."""
+
+    calls = 0
+
+    @staticmethod
+    def forward(ctx: Any, tensor: Tensor) -> Tensor:
+        """Save the input and return its square."""
+        _SaveExactInput.calls += 1
+        ctx.save_for_backward(tensor)
+        return tensor * tensor
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> Tensor:
+        """Use the saved input to compute the square gradient."""
+        (tensor,) = ctx.saved_tensors
+        return grad_output * 2 * tensor
 
 
 class _FunctionBlock(nn.Cell):
@@ -90,6 +131,27 @@ class _StateBlock(nn.Cell):
         self.states.append(is_recomputing())
         output = self.middle(x * 2)
         return (output * x).sum()
+
+
+class _SavedInputBlock(nn.Cell):
+    """Checkpointed block whose excluded tail saves its exact input."""
+
+    def __init__(self, calls: dict) -> None:
+        """Wrap a custom saved-input function and retain the shared counter."""
+        super().__init__()
+        self.calls = calls
+
+        def excluded(tensor: Tensor) -> Tensor:
+            """Save the exact recomputed input without rerunning on replay."""
+            self.calls["excluded"] += 1
+            return _SaveExactInput.apply(tensor)
+
+        self.excluded = checkpoint_exclude_wrapper(excluded)
+
+    def construct(self, tensor: Tensor) -> Tensor:
+        """End the checkpoint body at the excluded region's scalar output."""
+        self.calls["block"] += 1
+        return self.excluded(tensor * 3).sum()
 
 
 class _PrecisionMiddle(nn.Cell):
@@ -216,6 +278,260 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         self.assertIsNot(packed, tensor)
         np.testing.assert_array_equal(packed.asnumpy(), tensor.asnumpy())
         self.assertIs(checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed), packed)
+
+    def test_saved_tensor_hook_uses_storage_matched_handle(self):
+        """An exact saved input should be deferred by storage/layout matching."""
+        tensor = Tensor(np.arange(4, dtype=np.float32))
+        recomputed = Tensor(np.arange(4, dtype=np.float32) * 2)
+
+        packed, bindings = _pack_with_inputs(tensor, (tensor,))
+
+        self.assertIsInstance(packed, checkpoint_exclude_wrapper_module._RecomputedInputHandle)
+        self.assertEqual(len(bindings), 1)
+        self.assertTrue(packed.recipe.exact_input)
+        with self.assertRaisesRegex(RuntimeError, "before recomputation"):
+            checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed)
+        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(None, bindings)
+        checkpoint_exclude_wrapper_module._materialize_recompute_inputs(entry, (recomputed,), {})
+        unpacked = checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed)
+        np.testing.assert_array_equal(unpacked.asnumpy(), recomputed.asnumpy())
+
+    def test_saved_input_view_is_rebuilt_from_replay_storage(self):
+        """A saved slice should be reconstructed with its shape, stride, and offset."""
+        base = Tensor(np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+        saved_view = base[:, 1:, :]
+
+        packed, bindings = _pack_with_inputs(saved_view, (base,))
+
+        self.assertIsInstance(packed, checkpoint_exclude_wrapper_module._RecomputedInputHandle)
+        self.assertFalse(packed.recipe.exact_input)
+        self.assertEqual(packed.recipe.relative_offset, 4)
+
+        replay = Tensor((np.arange(24, dtype=np.float32) + 100).reshape(2, 3, 4))
+        expected = replay[:, 1:, :]
+        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(None, bindings)
+        checkpoint_exclude_wrapper_module._materialize_recompute_inputs(entry, (replay,), {})
+        restored = checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed)
+
+        np.testing.assert_array_equal(restored.asnumpy(), expected.asnumpy())
+        self.assertEqual(tuple(restored.shape), tuple(expected.shape))
+        self.assertEqual(tuple(restored.stride()), tuple(expected.stride()))
+        self.assertEqual(restored.storage_offset(), expected.storage_offset())
+        self.assertEqual(
+            restored.untyped_storage().data_ptr(),
+            replay.untyped_storage().data_ptr(),
+        )
+
+    def test_storage_match_prefers_exact_input_among_shared_storage_views(self):
+        """Exact layout should disambiguate query/rope-like views sharing storage."""
+        packed_q_rope = Tensor(np.arange(48, dtype=np.float32).reshape(2, 3, 8))
+        query = packed_q_rope[:, :, :6]
+        query_rope = packed_q_rope[:, :, 6:]
+
+        packed, bindings = _pack_with_inputs(query_rope, (query, query_rope))
+
+        self.assertIsInstance(packed, checkpoint_exclude_wrapper_module._RecomputedInputHandle)
+        self.assertEqual(len(bindings), 1)
+        self.assertEqual(bindings[0].path, (("arg", 1),))
+        self.assertTrue(packed.recipe.exact_input)
+
+    def test_non_overlapping_and_dense_layout_detection(self):
+        """Dense non-contiguous layouts pass; holed, expanded, and negative ones fail."""
+        metadata = checkpoint_exclude_wrapper_module._tensor_metadata
+        is_dense = checkpoint_exclude_wrapper_module._is_non_overlapping_and_dense
+
+        contiguous = Tensor(np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+        self.assertTrue(is_dense(metadata(contiguous)))
+        self.assertTrue(is_dense(metadata(contiguous.transpose(1, 0, 2))))
+        self.assertTrue(is_dense(metadata(contiguous.transpose(2, 0, 1))))
+        self.assertFalse(is_dense(metadata(contiguous[:, ::2, :])))
+        self.assertFalse(
+            is_dense(metadata(ops.broadcast_to(Tensor(np.arange(4, dtype=np.float32)), (3, 4))))
+        )
+        negative_stride = dataclasses.replace(metadata(contiguous), stride=(-12, 4, 1))
+        self.assertFalse(is_dense(negative_stride))
+
+    def test_saved_view_of_transposed_dense_base_is_rebuilt(self):
+        """A view of a transposed (non-contiguous but dense) base should be rebuilt."""
+        source = Tensor(np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+        base = source.transpose(1, 0, 2)
+        self.assertFalse(base.is_contiguous())
+        saved_view = base[1:, :, :]
+
+        packed, bindings = _pack_with_inputs(saved_view, (base,))
+
+        self.assertIsInstance(packed, checkpoint_exclude_wrapper_module._RecomputedInputHandle)
+        self.assertEqual(len(bindings), 1)
+        self.assertFalse(packed.recipe.exact_input)
+
+        replay = Tensor((np.arange(24, dtype=np.float32) + 100).reshape(2, 3, 4)).transpose(1, 0, 2)
+        expected = replay[1:, :, :]
+        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(None, bindings)
+        checkpoint_exclude_wrapper_module._materialize_recompute_inputs(entry, (replay,), {})
+        restored = checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed)
+
+        np.testing.assert_array_equal(restored.asnumpy(), expected.asnumpy())
+        self.assertEqual(tuple(restored.stride()), tuple(expected.stride()))
+        self.assertEqual(
+            restored.untyped_storage().data_ptr(),
+            replay.untyped_storage().data_ptr(),
+        )
+
+    def test_saved_view_of_holed_base_falls_back_to_real_save(self):
+        """A view whose base has storage holes cannot be replayed and is saved for real."""
+        source = Tensor(np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+        holed_base = source[:, ::2, :]
+        saved_view = holed_base[:, 0:1, :]
+
+        packed, bindings = _pack_with_inputs(saved_view, (holed_base,))
+
+        self.assertNotIsInstance(packed, checkpoint_exclude_wrapper_module._RecomputedInputHandle)
+        self.assertEqual(bindings, [])
+        np.testing.assert_array_equal(packed.asnumpy(), saved_view.asnumpy())
+
+    def test_new_storage_saved_tensor_falls_back_to_real_save(self):
+        """A computed copy cannot be rebuilt from layout metadata alone."""
+        tensor = Tensor(np.arange(4, dtype=np.float32))
+        copied = tensor + 1
+
+        packed, bindings = _pack_with_inputs(copied, (tensor,))
+
+        self.assertNotIsInstance(packed, checkpoint_exclude_wrapper_module._RecomputedInputHandle)
+        self.assertEqual(bindings, [])
+        np.testing.assert_array_equal(packed.asnumpy(), copied.asnumpy())
+
+    def test_recompute_boundary_saves_zero_element_trigger(self):
+        """The replay boundary should not retain storage from its tensor output."""
+        packed_shapes = []
+        unpacked_shapes = []
+
+        def pack_hook(tensor: Tensor) -> Tensor:
+            """Record the tensor packed by the boundary."""
+            packed_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        def unpack_hook(tensor: Tensor) -> Tensor:
+            """Record the tensor unpacked by the boundary."""
+            unpacked_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        def apply_boundary(tensor: Tensor) -> Tensor:
+            """Apply the boundary in a differentiable function."""
+            return checkpoint_exclude_wrapper_module._RecomputeBoundary.apply(tensor).sum()
+
+        tensor = Tensor(np.arange(4, dtype=np.float32))
+        with ms.saved_tensors_hooks(pack_hook, unpack_hook):
+            _, grad = ms.value_and_grad(apply_boundary)(tensor)
+
+        self.assertEqual(packed_shapes, [(0,)])
+        self.assertEqual(unpacked_shapes, [(0,)])
+        np.testing.assert_array_equal(grad.asnumpy(), np.ones(4, dtype=np.float32))
+
+    def test_recompute_boundary_lazily_reuses_trigger(self):
+        """The boundary trigger should be created lazily and reused globally."""
+        get_trigger = checkpoint_exclude_wrapper_module._get_recompute_trigger
+        get_trigger.cache_clear()
+
+        self.assertEqual(get_trigger.cache_info().currsize, 0)
+        trigger = get_trigger()
+        self.assertIs(trigger, get_trigger())
+        self.assertEqual(trigger.dtype, ms.float32)
+        self.assertEqual(tuple(trigger.shape), (0,))
+        self.assertEqual(get_trigger.cache_info().currsize, 1)
+
+    def test_parameter_input_is_not_captured(self):
+        """Parameter inputs should keep the existing saved-tensor behavior."""
+        parameter = Parameter(Tensor(np.arange(4, dtype=np.float32)), name="exclude_parameter")
+
+        inputs = checkpoint_exclude_wrapper_module._capture_recompute_inputs((parameter,), {})
+
+        self.assertEqual(inputs, ())
+
+    def test_input_capture_does_not_change_active_pack_state_on_failure(self):
+        """A traversal failure should not leak active pack state."""
+        class _BrokenDict(dict):
+            """Raise while exposing nested items."""
+
+            def items(self) -> Any:
+                """Fail before returning nested items."""
+                raise RuntimeError("nested traversal failed")
+
+        tensor = Tensor(np.arange(4, dtype=np.float32))
+
+        with self.assertRaisesRegex(RuntimeError, "nested traversal failed"):
+            checkpoint_exclude_wrapper_module._capture_recompute_inputs((tensor, _BrokenDict()), {})
+
+        self.assertIsNone(checkpoint_exclude_wrapper_module._ACTIVE_PACK_STATE.get())
+
+    def test_nested_input_paths_materialize_matching_replay_tensors(self):
+        """Nested args and kwargs should bind handles without retaining forward inputs."""
+        first = Tensor(np.array([1.0, 2.0], dtype=np.float32))
+        second = Tensor(np.array([3.0, 4.0], dtype=np.float32))
+        args = ({"items": [first]}, first)
+        kwargs = {"second": second}
+
+        packed_first, first_bindings = _pack_with_inputs(first, args, kwargs)
+        packed_second, second_bindings = _pack_with_inputs(second, args, kwargs)
+        bindings = first_bindings + second_bindings
+
+        replay_first = Tensor(np.array([5.0, 6.0], dtype=np.float32))
+        replay_second = Tensor(np.array([7.0, 8.0], dtype=np.float32))
+        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(output=None, input_bindings=bindings)
+        checkpoint_exclude_wrapper_module._materialize_recompute_inputs(
+            entry,
+            ({"items": [replay_first]}, replay_first),
+            {"second": replay_second},
+        )
+
+        self.assertEqual(len(bindings), 2)
+        self.assertEqual(bindings[0].path, (("arg", 0), ("key", "items"), ("index", 0)))
+        self.assertEqual(bindings[1].path, (("kwarg", "second"),))
+        np.testing.assert_array_equal(
+            checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed_first).asnumpy(),
+            replay_first.asnumpy(),
+        )
+        np.testing.assert_array_equal(
+            checkpoint_exclude_wrapper_module._unpack_saved_tensor(packed_second).asnumpy(),
+            replay_second.asnumpy(),
+        )
+
+    def test_input_traversal_does_not_require_cycle_collection(self):
+        """Input traversal should release tensor leaves without waiting for cyclic GC."""
+        def traverse_tensor() -> weakref.ReferenceType:
+            """Collect a tensor input and return a non-owning reference to it."""
+            tensor = Tensor(np.arange(4, dtype=np.float32))
+            inputs = checkpoint_exclude_wrapper_module._capture_recompute_inputs(([tensor],), {})
+            self.assertEqual(len(inputs), 1)
+            return weakref.ref(tensor)
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            tensor_ref = traverse_tensor()
+            self.assertIsNone(tensor_ref())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            gc.collect()
+
+    def test_recomputed_input_materializes_before_excluded_backward(self):
+        """A terminal excluded region should recover its saved input from replay."""
+        calls = {"block": 0, "excluded": 0}
+        _SaveExactInput.calls = 0
+        net = checkpoint_wrapper(_SavedInputBlock(calls))
+        tensor = Tensor(np.array([1.0, 2.0], dtype=np.float32))
+
+        value, grad = ms.value_and_grad(net, grad_position=0)(tensor)
+
+        np.testing.assert_allclose(value.asnumpy(), np.array(45.0, np.float32), atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(
+            grad.asnumpy(),
+            np.array([18.0, 36.0], np.float32),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        self.assertEqual(calls, {"block": 2, "excluded": 1})
+        self.assertEqual(_SaveExactInput.calls, 1)
 
     def test_function_wrapper_skips_middle_recompute(self):
         """A wrapped function should run in forward and reuse its output in recompute."""
