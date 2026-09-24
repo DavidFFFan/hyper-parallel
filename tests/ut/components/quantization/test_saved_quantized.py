@@ -19,6 +19,7 @@ import itertools
 import unittest
 import weakref
 from contextlib import nullcontext
+from typing import Any, Callable
 
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
@@ -31,7 +32,7 @@ from tests.ut.components.quantization import test_mxfp8_memory as mx_tests
 class SavedQuantizedTests(unittest.TestCase):
     """Exercise real autograd wrappers with CPU arithmetic stand-ins."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Keep CPU checkpoint selection and RNG state isolated from other tests."""
         self.addCleanup(torch.set_rng_state, torch.get_rng_state())
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
@@ -39,7 +40,9 @@ class SavedQuantizedTests(unittest.TestCase):
         DefaultDeviceType.set_device_type('cpu')
 
     @staticmethod
-    def projection(fmt, grouped, needs, empty=False):
+    def projection(
+        fmt: str, grouped: bool, needs: tuple[bool, bool], empty: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build a fresh deterministic graph without hardware arithmetic."""
         if fmt == 'mxfp8':
             return mx_tests.MXFP8MemoryTests.projection(grouped, needs, empty=empty)[:3]
@@ -82,7 +85,8 @@ class SavedQuantizedTests(unittest.TestCase):
             with self.subTest(fmt=fmt, grouped=grouped):
                 refs = []
 
-                def pack(tensor, record=refs.append):
+                def pack(tensor: torch.Tensor, record: Callable[[Any], None] = refs.append) -> torch.Tensor:
+                    """Copy one physical payload while recording its weak reference."""
                     self.assertIs(type(tensor), torch.Tensor)
                     packed = tensor.detach().clone()
                     record(weakref.ref(packed))
@@ -131,7 +135,11 @@ class SavedQuantizedTests(unittest.TestCase):
                              if fmt == 'mxfp8' else hif8_tests.IdentityQuantizer())
                 groups = torch.tensor([2, 0, 3] if fmt == 'mxfp8' else [2, 3])
 
-                def project(inputs, weight, fmt=fmt, grouped=grouped, groups=groups, quantizer=quantizer):
+                def project(
+                    inputs: torch.Tensor, weight: torch.Tensor, fmt: str = fmt, grouped: bool = grouped,
+                    groups: torch.Tensor = groups, quantizer: Any = quantizer,
+                ) -> torch.Tensor:
+                    """Recompute one grouped or dense quantized projection."""
                     if fmt == 'mxfp8':
                         if grouped:
                             return mx_tests.npu_quant_grouped_linear(
