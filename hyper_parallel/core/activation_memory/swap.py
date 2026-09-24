@@ -541,7 +541,8 @@ class SwapGroup:
         bucket["total_numel"] += x.val.numel()
         return x
 
-    def _finalize_packed_buckets(self, candidate_buckets, packed_info, packed_buckets, packed_by_bucket) -> int:
+    @staticmethod
+    def _finalize_packed_buckets(candidate_buckets, packed_info, packed_buckets, packed_by_bucket) -> int:
         """Turn multi-tensor candidate buckets into packed buckets; return owned bytes."""
         total_bytes = 0
         for dtype_bucket_list in candidate_buckets.values():
