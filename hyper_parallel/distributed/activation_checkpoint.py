@@ -895,6 +895,17 @@ def _select_layer_region_roots(
     ]
 
 
+def _matches_exclusion(module_fqn: str, module: nn.Module, recompute_spec: Any) -> bool:
+    """Return whether one module is declared to stay outside the replay."""
+    if any(
+        fnmatch.fnmatchcase(module_fqn, pattern)
+        for pattern in recompute_spec.exclude_patterns
+    ):
+        return True
+    predicate = getattr(recompute_spec, "exclude_predicate", None)
+    return bool(predicate is not None and predicate(module_fqn, module))
+
+
 def _select_excluded_targets(
     module_by_fqn: dict,
     region_roots: list,
@@ -909,10 +920,7 @@ def _select_excluded_targets(
             for root_fqn in root_fqns
         ):
             continue
-        if any(
-            fnmatch.fnmatchcase(module_fqn, pattern)
-            for pattern in recompute_spec.exclude_patterns
-        ):
+        if _matches_exclusion(module_fqn, module, recompute_spec):
             selected_targets.append((module_fqn, module))
     return selected_targets
 
@@ -993,9 +1001,13 @@ def _apply_model_adapter_regions_checkpointing(
             "model adapter recompute patterns matched no region in the selected layers"
         )
     exclude_targets = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
-    if recompute_spec.exclude_patterns and not exclude_targets:
+    declared_exclusions = bool(
+        recompute_spec.exclude_patterns
+        or getattr(recompute_spec, "exclude_predicate", None) is not None
+    )
+    if declared_exclusions and not exclude_targets:
         raise ValueError(
-            "model adapter recompute exclude patterns matched no module "
+            "model adapter recompute exclusions matched no module "
             "inside the selected regions"
         )
     _validate_region_exclusions(roots, exclude_targets)

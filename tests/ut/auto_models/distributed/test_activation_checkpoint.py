@@ -323,7 +323,7 @@ class TestModelAdapterRecomputeRegions(unittest.TestCase):
         )
         model, adapter = self._model(policy)
 
-        with self.assertRaisesRegex(ValueError, "exclude patterns matched no module"):
+        with self.assertRaisesRegex(ValueError, "exclusions matched no module"):
             self._apply(model, adapter, self._selection(layer_count=2))
 
     def test_leaf_region_patterns_keep_one_region_per_submodule(self):
@@ -356,6 +356,24 @@ class TestModelAdapterRecomputeRegions(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "HP-STATE-002"):
             self._apply(model, adapter, self._selection(layer_count=1))
+
+    def test_exclude_predicate_keeps_named_modules_out_of_replay(self):
+        """An attribute rule can express exclusions that a path cannot."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_predicate=lambda fqn, module: bool(getattr(module, "keeps_state", False)),
+        )
+        model, adapter = self._model(policy)
+        for tower in (model.text_tower, model.image_tower):
+            for block in tower.decoder.values():
+                block.self_attn.keeps_state = True
+
+        self._apply(model, adapter, self._selection())
+
+        for tower in (model.text_tower, model.image_tower):
+            for block in tower.decoder.values():
+                self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
+                self.assertTrue(hasattr(block, "_wrapped_module"))
 
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):

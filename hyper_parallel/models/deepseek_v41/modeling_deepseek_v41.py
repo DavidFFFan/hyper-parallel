@@ -700,7 +700,10 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         plan = getattr(self, "_cached_state_release_plan", None)
         if plan is None:
             plan = (
-                build_shared_state_release_plan(self.config)
+                build_shared_state_release_plan(
+                    self.config,
+                    getattr(self.config, "v41_replayed_csa2_layers", ()),
+                )
                 if getattr(self.config, "v41_release_consumed_shared_state", False)
                 else {}
             )

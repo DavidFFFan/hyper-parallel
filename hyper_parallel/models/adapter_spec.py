@@ -56,10 +56,16 @@ class RecomputePolicy:
     ``on_applied`` lets a model enable runtime behaviour that is only valid once
     its excluded descendants stay outside replay, for example releasing
     cross-layer state as soon as its last consumer has read it.
+
+    ``exclude_predicate`` complements the patterns with an attribute rule that a
+    path cannot express, such as "exclude every module that publishes state".
+    It receives ``(module_fqn, module)`` and is evaluated together with
+    ``exclude_patterns``.
     """
 
     region_patterns: tuple[str, ...]
     exclude_patterns: tuple[str, ...] = ()
+    exclude_predicate: Optional[Callable[[str, Any], bool]] = None
     on_applied: Optional[Callable[[Any], None]] = None
 
 

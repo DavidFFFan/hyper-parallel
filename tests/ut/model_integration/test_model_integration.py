@@ -1376,6 +1376,30 @@ class TestModelIntegrationContracts(unittest.TestCase):
 
         self.assertIn(2, state.topk_indices_by_source)
 
+    def test_shared_state_release_plan_defers_replayed_consumers(self) -> None:
+        """An entry that a replayed consumer still needs survives into backward."""
+        config = self._released_topology_config()
+        producers = {2, 8, 14, 20, 24, 28, 32, 36}
+        replayed = [
+            layer
+            for layer in range(config.num_hidden_layers)
+            if config.v41_compress_ratios[layer] > 0 and layer not in producers
+        ]
+
+        plan = build_shared_state_release_plan(config, replayed)
+
+        # Compressed K=V and Top-K are read again while the consumer replays.
+        self.assertNotIn(7, plan)
+        self.assertNotIn(23, plan)
+        self.assertNotIn(39, plan)
+        # The encoder indexer K has no consumer at all, so it is still released.
+        self.assertEqual(plan[2], (("index_key", 2),))
+        self.assertEqual(plan[8], (("index_key", 8),))
+        self.assertEqual(plan[14], (("index_key", 14),))
+        # Layer 20's indexer K is last read by Reindex 36, which stays unreplayed.
+        self.assertEqual(plan[36], (("index_key", 20),))
+        self.assertEqual(sorted(plan), [2, 8, 14, 36])
+
     def test_release_consumed_drops_only_the_planned_entries(self) -> None:
         """One consumer releases its own entries and keeps later groups intact."""
         state = SharedCompressedAttentionState(

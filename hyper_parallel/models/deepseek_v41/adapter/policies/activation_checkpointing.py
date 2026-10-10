@@ -14,27 +14,40 @@
 # ============================================================================
 """Declare the DeepSeek-V4.1 recompute regions used by normal training."""
 
+from typing import Any
+
 from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
-    enable_early_release,
+    configure_shared_state,
 )
+
+
+def _exclude_state_publishers(module_fqn: str, module: Any) -> bool:
+    """Keep every CSA2 layer that publishes cross-layer state outside replay.
+
+    A "Full" or "Reindex" layer publishes compressed K=V, the indexer K or the
+    Top-K selection, and replaying it would publish them a second time. A
+    "Reuse" layer only reads state, so it can be replayed, and the two pure SWA
+    layers do not touch the shared state at all.
+    """
+    del module_fqn
+    return bool(getattr(module, "is_index_source", False))
 
 
 def build_recompute_policy() -> RecomputePolicy:
     """Return the V4.1 recompute regions used by normal training.
 
-    Every decoder layer is one region, and the CSA2 attention modules inside it
-    are excluded: attention publishes and consumes the per-forward shared state
-    and launches CP collectives, so it must not be replayed. The cost of that
-    exclusion is attention's own saved activations, while the rest of the layer
-    (mHC, MoE, norms, Engram, and the in-layer mixing ops) is recomputed. The
-    model-owned hook then enables releasing published state as soon as its last
-    consumer has read it.
+    Every decoder layer is one region. Only the CSA2 layers that publish the
+    per-forward shared state stay outside the replay; the Reuse layers and the
+    two pure SWA layers are recomputed, which trades one extra forward pass for
+    their saved activations. The model-owned hook then enables the release
+    schedule and records which consumers replay, so an entry that a replayed
+    consumer still needs is kept until backward is done with it.
     """
     return RecomputePolicy(
         region_patterns=("model.layers.*",),
-        exclude_patterns=("model.layers.*.self_attn",),
-        on_applied=enable_early_release,
+        exclude_predicate=_exclude_state_publishers,
+        on_applied=configure_shared_state,
     )
 
 
