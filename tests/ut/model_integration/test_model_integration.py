@@ -32,6 +32,7 @@ from torch import nn
 
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionState,
+    SharedCompressedDSAIndexer,
 )
 from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
     build_shared_state_release_plan,
@@ -1375,6 +1376,59 @@ class TestModelIntegrationContracts(unittest.TestCase):
         state.release_consumed(7)
 
         self.assertIn(2, state.topk_indices_by_source)
+
+    def test_indexer_routes_selection_through_the_exclusion_region(self) -> None:
+        """An enabled exclusion region owns the discrete selection call."""
+
+        class _ReindexSource(nn.Module):
+            """Minimal Reindex-style source that exercises the selection contract."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.q_b_proj = nn.Linear(4, 4, bias=False)
+                self.weights_proj = nn.Linear(4, 2, bias=False)
+                self.compress_ratio = 1
+                self.num_heads = 2
+                self.head_dim = 2
+                self.index_topk = 2
+                self.owns_key = False
+                self.is_candidate_source = False
+                self.uses_candidates = True
+                self.candidate_topk_blocks = 1
+                self.candidate_block_size = 2
+                self.loss_coeff = 0.0
+
+        indexer = SharedCompressedDSAIndexer(_ReindexSource())
+        hidden_states = torch.randn(1, 3, 4)
+        query_residual = torch.randn(1, 3, 4)
+        index_key = torch.randn(1, 5, 2)
+        # cos/sin carry half the rotary channels: _apply_v41_rope interleaves them.
+        cos = torch.randn(1, 3, 1)
+        sin = torch.randn(1, 3, 1)
+        saved_topk = torch.tensor([[[1, 2]]], dtype=torch.int32)
+        saved_candidates = torch.tensor([[[0]]], dtype=torch.int32)
+
+        def _cached_selection(*_args, **_kwargs):
+            """Stand in for the exclusion wrapper's cached selection."""
+            return saved_topk, saved_candidates
+
+        indexer._selection_region = {"wrapper": _cached_selection}  # pylint: disable=W0212
+        output = indexer(
+            hidden_states,
+            query_residual,
+            None,
+            (cos, sin),
+            index_key=index_key,
+            candidate_blocks=saved_candidates,
+        )
+
+        # The selection came from the exclusion region; the projections above it
+        # are still computed because they carry the Indexer gradients.
+        self.assertIs(output.topk_indices, saved_topk)
+        self.assertIs(output.candidate_blocks, saved_candidates)
+        self.assertIs(output.index_key, index_key)
+        self.assertEqual(tuple(output.index_query.shape), (1, 3, 2, 2))
+        self.assertEqual(tuple(output.merge_weight.shape), (1, 3, 2))
 
     def test_shared_state_release_plan_defers_replayed_consumers(self) -> None:
         """An entry that a replayed consumer still needs survives into backward."""

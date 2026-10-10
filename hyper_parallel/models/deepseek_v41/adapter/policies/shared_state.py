@@ -105,22 +105,32 @@ def build_shared_state_release_plan(
 
 
 def configure_shared_state(model: Any) -> None:
-    """Enable the CSA2 release schedule and record the replayable layers.
+    """Enable the CSA2 release schedule and prepare the replayable layers.
 
     The release schedule is only valid when it knows which consumers run again
     during backward: a replayed consumer reads its entries a second time, so
-    those entries must be kept. The replayable set is read off the final module
-    tree, where an excluded attention is wrapped and a replayed one is not.
+    those entries must be kept. Replayed index-producing layers additionally get
+    their discrete selection turned into an exclusion region, because a replay
+    must neither choose a different key set nor change how many tensors the
+    checkpoint sees in each phase.
     """
     config = getattr(model, "config", None)
     if config is None:
         return
+    replayed = _replayed_attentions(model)
+    for module in replayed:
+        if getattr(module, "is_index_source", False):
+            indexer = getattr(module, "indexer", None)
+            if indexer is not None:
+                indexer.enable_selection_exclude()
     config.v41_release_consumed_shared_state = True
-    config.v41_replayed_csa2_layers = tuple(_replayed_attention_layers(model))
+    config.v41_replayed_csa2_layers = tuple(
+        sorted(int(getattr(module, "layer_idx")) for module in replayed)
+    )
 
 
-def _replayed_attention_layers(model: Any) -> list[int]:
-    """Return the CSA2 layers whose attention runs again during backward."""
+def _replayed_attentions(model: Any) -> list[Any]:
+    """Return the attention modules that run again during backward."""
     from hyper_parallel.core.activation_memory.wrapper import (  # pylint: disable=C0415
         CheckpointExcludeWrapper,
     )
@@ -129,17 +139,16 @@ def _replayed_attention_layers(model: Any) -> list[int]:
     for module in model.modules():
         if isinstance(module, CheckpointExcludeWrapper):
             excluded_inner_ids.add(id(module._wrapped_module))  # pylint: disable=W0212
-    layers = []
+    replayed = []
     for module in model.modules():
         if not getattr(module, "compress_ratio", 0):
             continue
-        layer_idx = getattr(module, "layer_idx", None)
-        if layer_idx is None or id(module) in excluded_inner_ids:
+        if getattr(module, "layer_idx", None) is None:
             continue
-        if isinstance(module, CheckpointExcludeWrapper):
+        if id(module) in excluded_inner_ids or isinstance(module, CheckpointExcludeWrapper):
             continue
-        layers.append(int(layer_idx))
-    return sorted(layers)
+        replayed.append(module)
+    return replayed
 
 
 __all__ = ["build_shared_state_release_plan", "configure_shared_state"]

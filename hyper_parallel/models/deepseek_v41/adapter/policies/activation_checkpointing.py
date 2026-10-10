@@ -23,26 +23,28 @@ from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
 
 
 def _exclude_state_publishers(module_fqn: str, module: Any) -> bool:
-    """Keep every CSA2 layer that publishes cross-layer state outside replay.
+    """Keep the CSA2 layers that both publish and consume state outside replay.
 
-    A "Full" or "Reindex" layer publishes compressed K=V, the indexer K or the
-    Top-K selection, and replaying it would publish them a second time. A
-    "Reuse" layer only reads state, so it can be replayed, and the two pure SWA
-    layers do not touch the shared state at all.
+    A Full layer still publishes compressed K=V and the indexer K, and its own
+    attention consumes them, so it stays out of the replay for now. A Reindex
+    layer only republishes a Top-K selection that the replay re-reads, which the
+    phase aware publish guard already covers, and a Reuse layer never publishes
+    at all. The two pure SWA layers do not touch the shared state.
     """
     del module_fqn
-    return bool(getattr(module, "is_index_source", False))
+    return bool(getattr(module, "is_kv_source", False))
 
 
 def build_recompute_policy() -> RecomputePolicy:
     """Return the V4.1 recompute regions used by normal training.
 
-    Every decoder layer is one region. Only the CSA2 layers that publish the
-    per-forward shared state stay outside the replay; the Reuse layers and the
-    two pure SWA layers are recomputed, which trades one extra forward pass for
-    their saved activations. The model-owned hook then enables the release
-    schedule and records which consumers replay, so an entry that a replayed
-    consumer still needs is kept until backward is done with it.
+    Every decoder layer is one region. Only Full layers stay outside the replay,
+    because they are the ones whose own attention consumes the compressed K=V
+    they just published; Reindex and Reuse layers are recomputed, and their
+    discrete Top-K selection is re-read from the shared state instead of being
+    chosen again. The model-owned hook then enables the release schedule and
+    records which consumers replay, so an entry a replayed consumer still needs
+    is kept until backward is done with it.
     """
     return RecomputePolicy(
         region_patterns=("model.layers.*",),
