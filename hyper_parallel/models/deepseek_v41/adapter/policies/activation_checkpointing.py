@@ -22,33 +22,17 @@ from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
 )
 
 
-def _exclude_state_publishers(module_fqn: str, module: Any) -> bool:
-    """Keep the CSA2 layers that both publish and consume state outside replay.
-
-    A Full layer still publishes compressed K=V and the indexer K, and its own
-    attention consumes them, so it stays out of the replay for now. A Reindex
-    layer only republishes a Top-K selection that the replay re-reads, which the
-    phase aware publish guard already covers, and a Reuse layer never publishes
-    at all. The two pure SWA layers do not touch the shared state.
-    """
-    del module_fqn
-    return bool(getattr(module, "is_kv_source", False))
-
-
 def build_recompute_policy() -> RecomputePolicy:
     """Return the V4.1 recompute regions used by normal training.
 
-    Every decoder layer is one region. Only Full layers stay outside the replay,
-    because they are the ones whose own attention consumes the compressed K=V
-    they just published; Reindex and Reuse layers are recomputed, and their
-    discrete Top-K selection is re-read from the shared state instead of being
-    chosen again. The model-owned hook then enables the release schedule and
-    records which consumers replay, so an entry a replayed consumer still needs
-    is kept until backward is done with it.
+    Every decoder layer is one region and every CSA2 layer replays: the shared
+    state keeps the discrete selections and the release schedule, so a replayed
+    layer neither chooses a different key set nor publishes its state twice. The
+    model-owned hook enables both behaviours once the regions are installed, and
+    records which consumers replay so their entries survive into backward.
     """
     return RecomputePolicy(
         region_patterns=("model.layers.*",),
-        exclude_predicate=_exclude_state_publishers,
         on_applied=configure_shared_state,
     )
 

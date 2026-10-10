@@ -1362,17 +1362,25 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
             shared_state: "SharedCompressedAttentionState",
             cp_context: "SharedCompressedAttentionCPContext | None",
-    ) -> tuple[torch.Tensor | None, "SequenceGatherHandle | None"]:
-        """Compress local hidden states and publish or launch the compressed KV."""
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, "SequenceGatherHandle | None"]:
+        """Compress local hidden states and publish or launch the compressed KV.
+
+        The locally produced tensor is handed back as well: a replayed Full layer
+        has to attend to its own recomputed K=V, not to the copy the original
+        forward published.
+        """
         latent = None
+        compressed = None
         compressed_handle = None
         if self.is_kv_source:
-            latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
-            if cp_context is None and not is_recomputing():
-                shared_state.publish_compressed_kv(self.layer_idx, compressed)
-            elif cp_context is not None:
-                compressed_handle = cp_context.launch(compressed, 1)
-        return latent, compressed_handle
+            latent, local_compressed = self.compressor(hidden_states, position_embeddings["compress"])
+            if cp_context is None:
+                if not is_recomputing():
+                    shared_state.publish_compressed_kv(self.layer_idx, local_compressed)
+                compressed = local_compressed
+            else:
+                compressed_handle = cp_context.launch(local_compressed, 1)
+        return latent, compressed, compressed_handle
 
     def _run_indexer(
             self,
@@ -1429,6 +1437,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             self,
             shared_state: "SharedCompressedAttentionState",
             key_value: torch.Tensor,
+            local_compressed: torch.Tensor | None,
             batch_size: int,
             sequence_length: int,
             device: torch.device,
@@ -1450,10 +1459,16 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         compressed_kv = None
         if not self.compress_ratio:
             return key_value, window, None
-        compressed_kv = shared_state.require_compressed_kv(
-            self.kv_source_layer_idx,
-            self.layer_idx,
-        )
+        if self.is_kv_source:
+            # Own K=V comes from this call, replayed or not.
+            compressed_kv = local_compressed
+            if compressed_kv is None:
+                raise RuntimeError("a Full layer must produce its own compressed K=V")
+        else:
+            compressed_kv = shared_state.require_compressed_kv(
+                self.kv_source_layer_idx,
+                self.layer_idx,
+            )
         topk_indices = shared_state.require_topk_indices(
             self.index_source_layer_idx,
             self.layer_idx,
@@ -1581,7 +1596,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         cos, sin = position_embeddings[rope_type]
         key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
         query_residual, query = self._project_query(hidden_states, cos, sin)
-        latent, compressed_handle = self._compute_compressed_kv(
+        latent, local_compressed, compressed_handle = self._compute_compressed_kv(
             hidden_states, position_embeddings, shared_state, cp_context
         )
         indexer_output = self._run_indexer(
@@ -1599,15 +1614,16 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         if raw_kv_handle is not None:
             key_value = raw_kv_handle.wait()
         if compressed_handle is not None:
-            compressed = compressed_handle.wait()
+            local_compressed = compressed_handle.wait()
             if not is_recomputing():
-                shared_state.publish_compressed_kv(self.layer_idx, compressed)
+                shared_state.publish_compressed_kv(self.layer_idx, local_compressed)
         if key_value is None:
             raise RuntimeError("raw KV all-gather did not produce a tensor")
 
         combined_key_value, sparse_indices, compressed_kv = self._build_sparse_indices(
             shared_state,
             key_value,
+            local_compressed,
             batch_size,
             sequence_length,
             hidden_states.device,
