@@ -859,11 +859,62 @@ class SharedCompressedDSAIndexer(nn.Module):
     ) -> SharedCompressedIndexerOutput:
         """Project local queries and score them against global compressed keys.
 
-        When the enclosing layer is replayed, :meth:`enable_selection_exclude`
-        makes the discrete selection a checkpoint exclusion region: it runs in
-        the original forward and its cached result is reused during the replay,
-        so the chosen key set can never drift and the checkpoint keeps seeing
-        the same saved tensors in both phases.
+        When the enclosing layer is replayed, :meth:`enable_input_exclude` and
+        :meth:`enable_selection_exclude` turn the projections and the discrete
+        selection into checkpoint exclusion regions: both run in the original
+        forward and their cached results are reused during the replay. The
+        projections carry the state an index source produces, so replaying them
+        is what a consumer's unpack would drag back in; the selection is
+        discrete, so a replay must never choose a different key set. Either way
+        the checkpoint keeps seeing the same saved tensors in both phases.
+        """
+        key, query, merge_weight, reduce_sum = self._run_inputs(
+            hidden_states,
+            query_residual,
+            latent,
+            compress_position_embeddings,
+            index_key=index_key,
+            cp_context=cp_context,
+            tp_context=tp_context,
+        )
+        topk_indices, selected_blocks = self._run_selection(
+            query,
+            key,
+            merge_weight,
+            candidate_blocks=candidate_blocks,
+            query_offset=query_offset,
+            minimum_key_indices=minimum_key_indices,
+            reduce_sum=reduce_sum,
+        )
+        return SharedCompressedIndexerOutput(
+            topk_indices=topk_indices,
+            index_key=key,
+            candidate_blocks=selected_blocks,
+            index_query=query,
+            merge_weight=merge_weight,
+        )
+
+    def _project_index_inputs(
+            self,
+            hidden_states: torch.Tensor,
+            query_residual: torch.Tensor,
+            latent: torch.Tensor | None,
+            compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            *,
+            index_key: torch.Tensor | None,
+            cp_context: SharedCompressedAttentionCPContext | None,
+            tp_context: SharedCompressedAttentionTPContext | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Callable[[torch.Tensor], torch.Tensor] | None,
+    ]:
+        """Project the index key, query and merge weights of this layer.
+
+        These projections are the state an index source owns: the key a Full
+        layer publishes, plus the per-layer query and weights both indexer
+        variants keep for the KL loss.
         """
         batch_size, sequence_length, _ = hidden_states.shape
         cos, sin = compress_position_embeddings
@@ -888,22 +939,47 @@ class SharedCompressedDSAIndexer(nn.Module):
         reduce_sum = None if tp_context is None else tp_context.reduce_sum
         if key_handle is not None:
             key = key_handle.wait()
-        topk_indices, candidate_blocks = self._run_selection(
-            query,
-            key,
-            merge_weight,
-            candidate_blocks=candidate_blocks,
-            query_offset=query_offset,
-            minimum_key_indices=minimum_key_indices,
-            reduce_sum=reduce_sum,
+        return key, query, merge_weight, reduce_sum
+
+    def _run_inputs(
+            self,
+            hidden_states: torch.Tensor,
+            query_residual: torch.Tensor,
+            latent: torch.Tensor | None,
+            compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            *,
+            index_key: torch.Tensor | None,
+            cp_context: SharedCompressedAttentionCPContext | None,
+            tp_context: SharedCompressedAttentionTPContext | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Callable[[torch.Tensor], torch.Tensor] | None,
+    ]:
+        """Project the indexer inputs directly, or through the exclusion region."""
+        region = getattr(self, "_input_region", None)
+        wrapper = region.get("wrapper") if isinstance(region, dict) else None
+        projection = wrapper if wrapper is not None else self._project_index_inputs
+        return projection(
+            hidden_states,
+            query_residual,
+            latent,
+            compress_position_embeddings,
+            index_key=index_key,
+            cp_context=cp_context,
+            tp_context=tp_context,
         )
-        return SharedCompressedIndexerOutput(
-            topk_indices=topk_indices,
-            index_key=key,
-            candidate_blocks=candidate_blocks,
-            index_query=query,
-            merge_weight=merge_weight,
-        )
+
+    def enable_input_exclude(self) -> None:
+        """Produce the indexer inputs once and reuse them while the layer replays.
+
+        The exclusions live in a plain container so the wrapper is not
+        registered as a child module of the indexer.
+        """
+        self._input_region = {
+            "wrapper": checkpoint_exclude_wrapper(self._project_index_inputs),
+        }
 
     def enable_selection_exclude(self) -> None:
         """Run the discrete selection once and reuse it while the layer replays.
@@ -1432,6 +1508,21 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 indexer_output.candidate_blocks,
             )
         return indexer_output
+
+    def enable_state_exclude(self) -> None:
+        """Keep this layer's cross-layer state production outside the replay.
+
+        A Full layer produces the compressed K=V and the indexer K that later
+        layers read, and a Reindex layer produces the query and weights its KL
+        loss needs. Excluding those segments keeps the tensors they publish real
+        during the replay instead of checkpoint placeholders, so a consumer's
+        backward unpacks data rather than the producer's graph.
+        """
+        if self.is_kv_source:
+            self.compressor = checkpoint_exclude_wrapper(self.compressor)
+        indexer = getattr(self, "indexer", None)
+        if self.is_index_source and indexer is not None:
+            indexer.enable_input_exclude()
 
     def _build_sparse_indices(
             self,

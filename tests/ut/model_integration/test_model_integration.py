@@ -1430,6 +1430,70 @@ class TestModelIntegrationContracts(unittest.TestCase):
         self.assertEqual(tuple(output.index_query.shape), (1, 3, 2, 2))
         self.assertEqual(tuple(output.merge_weight.shape), (1, 3, 2))
 
+    def test_indexer_routes_projections_through_the_exclusion_region(self) -> None:
+        """An enabled input region owns the key, query, and weight projections."""
+
+        class _FullSource(nn.Module):
+            """Minimal Full-style source that exercises the projection contract."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.q_b_proj = nn.Linear(4, 4, bias=False)
+                self.weights_proj = nn.Linear(4, 2, bias=False)
+                self.wk = nn.Linear(4, 2, bias=False)
+                self.k_norm = nn.LayerNorm(2, bias=False)
+                self.compress_ratio = 1
+                self.num_heads = 2
+                self.head_dim = 2
+                self.index_topk = 2
+                self.owns_key = True
+                self.is_candidate_source = False
+                self.uses_candidates = False
+                self.candidate_topk_blocks = 1
+                self.candidate_block_size = 2
+                self.loss_coeff = 0.0
+
+        indexer = SharedCompressedDSAIndexer(_FullSource())
+        indexer.enable_input_exclude()
+
+        # The wrapper lives in a plain container, so the module tree is unchanged.
+        self.assertNotIn("wrapper", dict(indexer.named_modules()))
+
+        hidden_states = torch.randn(1, 3, 4)
+        query_residual = torch.randn(1, 3, 4)
+        latent = torch.randn(1, 2, 4)
+        cos = torch.randn(1, 3, 1)
+        sin = torch.randn(1, 3, 1)
+        saved_key = torch.randn(1, 3, 2)
+        saved_query = torch.randn(1, 3, 2, 2)
+        saved_weight = torch.randn(1, 3, 2)
+        saved_topk = torch.tensor([[[1, 2]]], dtype=torch.int32)
+
+        def _cached_projection(*_args, **_kwargs):
+            """Stand in for the exclusion wrapper's cached projections."""
+            return saved_key, saved_query, saved_weight, None
+
+        received = {}
+
+        def _capture_selection(query, key, merge_weight, **_kwargs):
+            """Record which tensors the selection region is handed."""
+            received.update(query=query, key=key, merge_weight=merge_weight)
+            return saved_topk, None
+
+        indexer._input_region = {"wrapper": _cached_projection}  # pylint: disable=W0212
+        indexer._selection_region = {"wrapper": _capture_selection}  # pylint: disable=W0212
+        output = indexer(hidden_states, query_residual, latent, (cos, sin))
+
+        # Both regions are siblings under the layer: the cached projection feeds
+        # the selection, and its results are what the indexer reports.
+        self.assertIs(received["key"], saved_key)
+        self.assertIs(received["query"], saved_query)
+        self.assertIs(received["merge_weight"], saved_weight)
+        self.assertIs(output.index_key, saved_key)
+        self.assertIs(output.index_query, saved_query)
+        self.assertIs(output.merge_weight, saved_weight)
+        self.assertIs(output.topk_indices, saved_topk)
+
     def test_shared_state_release_plan_defers_replayed_consumers(self) -> None:
         """An entry that a replayed consumer still needs survives into backward."""
         config = self._released_topology_config()

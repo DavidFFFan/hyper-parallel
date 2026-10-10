@@ -112,7 +112,9 @@ def configure_shared_state(model: Any) -> None:
     those entries must be kept. Replayed index-producing layers additionally get
     their discrete selection turned into an exclusion region, because a replay
     must neither choose a different key set nor change how many tensors the
-    checkpoint sees in each phase.
+    checkpoint sees in each phase. Replayed state producers get their producer
+    segment excluded as well, so the tensors they publish stay real data for
+    every consumer instead of replay placeholders.
     """
     config = getattr(model, "config", None)
     if config is None:
@@ -123,6 +125,9 @@ def configure_shared_state(model: Any) -> None:
             indexer = getattr(module, "indexer", None)
             if indexer is not None:
                 indexer.enable_selection_exclude()
+        enable_state_exclude = getattr(module, "enable_state_exclude", None)
+        if callable(enable_state_exclude):
+            enable_state_exclude()
     config.v41_release_consumed_shared_state = True
     config.v41_replayed_csa2_layers = tuple(
         sorted(int(getattr(module, "layer_idx")) for module in replayed)
