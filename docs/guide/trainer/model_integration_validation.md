@@ -460,6 +460,20 @@ activation_checkpoint:
 
 `layer_indices` 从 `0` 开始，必须非空、非负且不重复。`source: default` 不接受这两个字段。
 
+#### 跨层 state 的异步卸载（`activation_swap: csa2_state`）
+
+整层重算之后，跨层 state 成为唯一随序列长度线性累积的激活：producer 发布后一直驻留到最后一个消费者的反向结束。`activation_swap: csa2_state` 把它交给同一套层链——条目由**最后一个读者**注册进自己所在层的 swap group，于是该层 forward 结束后异步卸载（copy stream 上 D2H）、在它的反向前第 N 层发起预取（`state_swap_prefetch_layers`，默认 1）、并在该层重放前完成回填，正好落在"没人读"的那段窗口里。注册只发生在 forward（`is_recomputing()` 挡住重放），条目对象本身不变，因此数值与不开 swap 逐位一致。
+
+```yaml
+activation_swap: csa2_state       # 只允许配 mode=selective + selection.source=model_adapter_safe_regions
+activation_checkpoint:
+  state_swap_scope: encoder       # encoder（默认）| all
+  state_swap_prefetch_layers: 1   # 预取提前量（层），越大越能掩盖更大的 H2D 拷贝
+  state_swap_host_mb: 0           # 钉住内存预算（MiB），0 = 不限；超出预算的条目留在设备上
+```
+
+模型侧的名单由 `configure_shared_state` 在区域装好后计算：按 `kv_source_layer_idx` / `index_source_layer_idx` / `candidate_source_layer_idx` 推导每个条目的读者集合与最后一个读者，只把"读者非空、全部落在 scope 内、最后一个读者是被重放的区域且不是末组"的条目交给 swap 链；其余条目（末组的 `compressed_kv`、无读者的 `index_key`、scope 外的 reindex 组）逐条打日志说明原因。钉住内存峰值等于被换出的字节数，可用 `state_swap_host_mb` 设上限。
+
 ## 4. 编写验证清单
 
 验证清单只描述模型身份、标准 Trainer 启动方式、实验矩阵和验收阈值。模型结构、数据集、dtype、tokenizer 和本地资产应留在 Trainer recipe；环境变量、源码 revision 和 hash 会自动进入证据，不在 YAML 中重复维护。

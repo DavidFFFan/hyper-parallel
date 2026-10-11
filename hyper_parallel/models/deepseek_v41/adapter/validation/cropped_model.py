@@ -329,6 +329,9 @@ def build_cropped_deepseek_v41(
         activation_checkpoint: str | None = None,
         activation_checkpoint_selection: Any | None = None,
         activation_swap: str = "none",
+        state_swap_scope: str = "encoder",
+        state_swap_prefetch_layers: int = 1,
+        state_swap_host_mb: int = 0,
         model_init_dtype: str = "float32",
 ) -> PreTrainedModel:
     """Build and parallelize the depth-preserving V4.1 parameter crop.
@@ -351,6 +354,12 @@ def build_cropped_deepseek_v41(
         activation_checkpoint: Activation-checkpoint mode.
         activation_checkpoint_selection: Optional adapter-safe region selection.
         activation_swap: Activation-swap mode.
+        state_swap_scope: Cross-layer state swap scope for
+            ``activation_swap="csa2_state"``.
+        state_swap_prefetch_layers: Layers of load prefetch ahead for the state
+            swap.
+        state_swap_host_mb: Optional pinned-host budget in MiB for the state
+            swap; ``0`` means unlimited.
         model_init_dtype: Final parameter initialization dtype.
 
     Returns:
@@ -377,6 +386,9 @@ def build_cropped_deepseek_v41(
         activation_checkpoint=activation_checkpoint,
         activation_checkpoint_selection=activation_checkpoint_selection,
         activation_swap=activation_swap,
+        state_swap_scope=state_swap_scope,
+        state_swap_prefetch_layers=state_swap_prefetch_layers,
+        state_swap_host_mb=state_swap_host_mb,
         model_init_dtype=model_init_dtype,
     )
 

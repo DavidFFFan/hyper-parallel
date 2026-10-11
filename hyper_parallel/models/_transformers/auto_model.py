@@ -92,6 +92,9 @@ class _BaseHyperAutoModelClass:
         activation_checkpoint: Optional[str] = None,
         swap_inputs: bool = False,
         activation_swap: str = "none",
+        state_swap_scope: str = "encoder",
+        state_swap_prefetch_layers: int = 1,
+        state_swap_host_mb: int = 0,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -145,6 +148,9 @@ class _BaseHyperAutoModelClass:
             activation_checkpoint=activation_checkpoint,
             swap_inputs=swap_inputs,
             activation_swap=activation_swap,
+            state_swap_scope=state_swap_scope,
+            state_swap_prefetch_layers=state_swap_prefetch_layers,
+            state_swap_host_mb=state_swap_host_mb,
             model_init_dtype=model_init_dtype,
             **kwargs,
         )
@@ -168,6 +174,9 @@ class _BaseHyperAutoModelClass:
         activation_checkpoint: Optional[str] = None,
         swap_inputs: bool = False,
         activation_swap: str = "none",
+        state_swap_scope: str = "encoder",
+        state_swap_prefetch_layers: int = 1,
+        state_swap_host_mb: int = 0,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -208,6 +217,9 @@ class _BaseHyperAutoModelClass:
             activation_checkpoint=activation_checkpoint,
             swap_inputs=swap_inputs,
             activation_swap=activation_swap,
+            state_swap_scope=state_swap_scope,
+            state_swap_prefetch_layers=state_swap_prefetch_layers,
+            state_swap_host_mb=state_swap_host_mb,
             model_init_dtype=model_init_dtype,
             **kwargs,
         )
@@ -237,6 +249,9 @@ class _BaseHyperAutoModelClass:
         activation_checkpoint_selection: Optional[Any] = None,
         swap_inputs: bool = False,
         activation_swap: str = "none",
+        state_swap_scope: str = "encoder",
+        state_swap_prefetch_layers: int = 1,
+        state_swap_host_mb: int = 0,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -309,6 +324,9 @@ class _BaseHyperAutoModelClass:
             activation_checkpoint_selection=activation_checkpoint_selection,
             swap_inputs=swap_inputs,
             activation_swap=activation_swap,
+            state_swap_scope=state_swap_scope,
+            state_swap_prefetch_layers=state_swap_prefetch_layers,
+            state_swap_host_mb=state_swap_host_mb,
             model_init_dtype=model_init_dtype,
         )
 

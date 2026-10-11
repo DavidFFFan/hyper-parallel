@@ -132,10 +132,20 @@ class ActivationCheckpointConfig:
 
     ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
     ``"selective"``.
+
+    ``state_swap_*`` tune the optional host offload of cross-layer state that
+    ``activation_swap: csa2_state`` enables; they are inert while that mode is
+    off. ``state_swap_scope`` selects which published entries a model may hand
+    to the swap chain: ``"encoder"`` keeps only the entries whose readers all
+    live before the first ``compress_ratio == 1`` layer, ``"all"`` covers every
+    entry that has an offload window.
     """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    state_swap_scope: Literal["encoder", "all"] = "encoder"
+    state_swap_prefetch_layers: int = 1
+    state_swap_host_mb: int = 0
     selection: ActivationCheckpointSelection = field(
         default_factory=ActivationCheckpointSelection
     )
@@ -144,6 +154,29 @@ class ActivationCheckpointConfig:
         """Reject ambiguous values for activation input swapping."""
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        if self.state_swap_scope not in ("encoder", "all"):
+            raise ValueError(
+                "activation_checkpoint.state_swap_scope must be one of "
+                f"encoder, all; got {self.state_swap_scope!r}"
+            )
+        if (
+            isinstance(self.state_swap_prefetch_layers, bool)
+            or not isinstance(self.state_swap_prefetch_layers, int)
+            or self.state_swap_prefetch_layers < 1
+        ):
+            raise ValueError(
+                "activation_checkpoint.state_swap_prefetch_layers must be a "
+                f"positive int; got {self.state_swap_prefetch_layers!r}"
+            )
+        if (
+            isinstance(self.state_swap_host_mb, bool)
+            or not isinstance(self.state_swap_host_mb, int)
+            or self.state_swap_host_mb < 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.state_swap_host_mb must be a "
+                f"non-negative int; got {self.state_swap_host_mb!r}"
+            )
 
 
 @dataclass

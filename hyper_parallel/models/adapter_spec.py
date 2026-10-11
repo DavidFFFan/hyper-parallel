@@ -34,6 +34,31 @@ from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
+class RecomputeContext:
+    """Runtime facts the region installer resolves before ``on_applied`` runs.
+
+    Attributes:
+        region_fqns: The installed region roots in model order. A model-owned
+            hook uses it to tell whether a module it cares about is replayed and
+            whether it is the last region in the chain.
+        state_swap: Whether cross-layer state of replayed regions is offloaded
+            to host memory through the swap prefetch chain.
+        state_swap_scope: Which entries the model may register, as declared by
+            the Trainer (``"encoder"`` or ``"all"``).
+        state_swap_prefetch_layers: How many layers ahead of a group's backward
+            its host-to-device load starts.
+        state_swap_host_mb: Optional pinned-host budget in MiB; ``0`` means no
+            budget, and entries beyond it stay on the device.
+    """
+
+    region_fqns: tuple[str, ...]
+    state_swap: bool = False
+    state_swap_scope: str = "encoder"
+    state_swap_prefetch_layers: int = 1
+    state_swap_host_mb: int = 0
+
+
+@dataclass(frozen=True)
 class RecomputePolicy:
     """Model-owned activation-checkpoint regions used by normal training.
 
@@ -56,8 +81,10 @@ class RecomputePolicy:
     config.
 
     ``on_applied`` lets a model enable runtime behaviour that depends on the
-    region shape finally installed, for example pinning the discrete selection
-    of every layer that will be replayed.
+    region shape finally installed — it receives the model plus the
+    :class:`RecomputeContext` — for example pinning the discrete selection of
+    every layer that will be replayed, or planning which cross-layer state
+    entries the swap chain offloads.
 
     ``exclude_predicate`` complements the patterns with an attribute rule that a
     path cannot express, such as "exclude every module that publishes state".
@@ -68,7 +95,7 @@ class RecomputePolicy:
     region_patterns: tuple[str, ...]
     exclude_patterns: tuple[str, ...] = ()
     exclude_predicate: Optional[Callable[[str, Any], bool]] = None
-    on_applied: Optional[Callable[[Any], None]] = None
+    on_applied: Optional[Callable[[Any, RecomputeContext], None]] = None
 
 
 @dataclass(frozen=True)

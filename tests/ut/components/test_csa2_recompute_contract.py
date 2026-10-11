@@ -29,8 +29,10 @@ them on CPU against the real classes:
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import torch
 from torch import nn
@@ -42,10 +44,12 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAIndexer,
 )
 from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts
 from hyper_parallel.core.activation_memory.wrapper import checkpoint_exclude_wrapper
 from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
     configure_shared_state,
 )
+from hyper_parallel.models.adapter_spec import RecomputeContext
 
 HIDDEN, HEADS, HEAD_DIM, GROUPS, OUT_PER_GROUP = 8, 2, 8, 2, 4
 BATCH, SEQUENCE, RATIO, LAYER = 1, 8, 2, 20
@@ -358,8 +362,231 @@ def test_hook_pins_the_selection_of_replayed_index_sources_only():
     """Every replayed index source is pinned, excluded and reused layers are not."""
     model = _FakeModel()
     model.layers[1] = checkpoint_exclude_wrapper(model.layers[1])
-    configure_shared_state(model)
+    configure_shared_state(model, RecomputeContext(region_fqns=("layers.0", "layers.2")))
 
     assert model.layers[0].indexer.selection_pinned is True
     assert model.layers[1]._wrapped_module.indexer.selection_pinned is False
     assert model.layers[2].indexer is None
+
+
+_KV_SOURCES = (2, 8, 14, 20)
+_INDEX_SOURCES = (2, 8, 14, 20, 24, 28, 32, 36)
+_CANDIDATE_SOURCE = 20
+
+
+class _SwapIndexer:
+    """Indexer stand-in carrying the reader-relevant flags."""
+
+    def __init__(self, *, owns_key: bool, uses_candidates: bool, is_candidate_source: bool) -> None:
+        """Record one indexer role."""
+        self.owns_key = owns_key
+        self.uses_candidates = uses_candidates
+        self.is_candidate_source = is_candidate_source
+        self.selection_pinned = False
+
+    def enable_selection_exclude(self) -> None:
+        """Record the selection pin the hook installs on every index source."""
+        self.selection_pinned = True
+
+
+class _SwapAttention(nn.Module):
+    """Attention stand-in exposing the attributes the swap plan reads."""
+
+    def __init__(
+            self,
+            layer_idx: int,
+            *,
+            ratio: int,
+            kv_source: int | None,
+            index_source: int | None,
+            candidate_source: int | None,
+            is_kv_source: bool = False,
+            is_index_source: bool = False,
+    ) -> None:
+        """Describe one released V4.1 layer role."""
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.compress_ratio = ratio
+        self.is_kv_source = is_kv_source
+        self.is_index_source = is_index_source
+        self.kv_source_layer_idx = kv_source
+        self.index_source_layer_idx = index_source
+        self.candidate_source_layer_idx = candidate_source
+        self.indexer = (
+            _SwapIndexer(
+                owns_key=is_kv_source,
+                uses_candidates=candidate_source is not None and candidate_source < layer_idx,
+                is_candidate_source=layer_idx == _CANDIDATE_SOURCE,
+            )
+            if is_index_source
+            else None
+        )
+
+
+class _SwapModel(nn.Module):
+    """Model stand-in with every attention inside a checkpoint region."""
+
+    def __init__(self, attentions: list[nn.Module]) -> None:
+        """Register the wrapped layers exactly like the region installer does."""
+        super().__init__()
+        self.config = SimpleNamespace()
+        self.layers = nn.ModuleList([checkpoint_wrapper(attention) for attention in attentions])
+
+
+def _crop_like_model() -> tuple[_SwapModel, list[nn.Module], tuple[str, ...]]:
+    """Build the released 40-layer V4.1 role layout, all layers inside regions."""
+    attentions = []
+    for layer_idx in range(40):
+        kv_source = max((source for source in _KV_SOURCES if source <= layer_idx), default=None)
+        index_source = max((source for source in _INDEX_SOURCES if source <= layer_idx), default=None)
+        ratio = 0 if layer_idx < _INDEX_SOURCES[0] else (2 if layer_idx < _CANDIDATE_SOURCE else 1)
+        attentions.append(
+            _SwapAttention(
+                layer_idx,
+                ratio=ratio,
+                kv_source=kv_source,
+                index_source=index_source,
+                candidate_source=(
+                    _CANDIDATE_SOURCE if _CANDIDATE_SOURCE <= layer_idx else None
+                ),
+                is_kv_source=layer_idx in _KV_SOURCES,
+                is_index_source=layer_idx in _INDEX_SOURCES,
+            )
+        )
+    model = _SwapModel(attentions)
+    region_fqns = tuple(f"layers.{layer_idx}" for layer_idx in range(40))
+    return model, attentions, region_fqns
+
+
+def _swap_plan(**overrides):
+    """Build the crop-like model and return its installed swap plan."""
+    model, attentions, region_fqns = _crop_like_model()
+    context = RecomputeContext(region_fqns=region_fqns, **{"state_swap": True, **overrides})
+    configure_shared_state(model, context)
+    # Layer 0 is a sliding-window layer, so the hook skips it; layer 7 is the
+    # first replayed compressed layer and carries the plan.
+    return attentions[7]._state_swap_plan, attentions
+
+
+def test_state_swap_plan_keeps_the_encoder_entries_by_default():
+    """Scope 'encoder' takes the three Full groups and nothing from the decoder."""
+    plan, _ = _swap_plan()
+
+    assert plan.enabled is True
+    assert plan.kinds_by_layer == {
+        7: frozenset({"compressed_kv", "topk"}),
+        13: frozenset({"compressed_kv", "topk"}),
+        19: frozenset({"compressed_kv", "topk"}),
+    }
+
+
+def test_state_swap_plan_extends_to_reindex_groups_with_scope_all():
+    """Scope 'all' adds the reindex groups and still drops the terminal readers."""
+    plan, _ = _swap_plan(state_swap_scope="all")
+
+    assert plan.kinds_by_layer == {
+        7: frozenset({"compressed_kv", "topk"}),
+        13: frozenset({"compressed_kv", "topk"}),
+        19: frozenset({"compressed_kv", "topk"}),
+        23: frozenset({"topk"}),
+        27: frozenset({"topk"}),
+        31: frozenset({"topk"}),
+        35: frozenset({"topk"}),
+        36: frozenset({"candidate", "index_key"}),
+    }
+
+
+def test_state_swap_plan_is_inert_until_the_trainer_enables_it():
+    """Without the Trainer switch the hook only pins selections."""
+    plan, attentions = _swap_plan(state_swap=False)
+
+    assert plan.enabled is False
+    assert plan.kinds_by_layer == {}
+    assert attentions[7]._state_swap_plan is plan
+
+
+class _RecordingPlan:
+    """Stand-in plan that records what the attention hands over."""
+
+    def __init__(self) -> None:
+        """Start with an empty record."""
+        self.calls: list[tuple[int, str, int, int]] = []
+
+    def register(
+            self,
+            layer_idx: int,
+            kind: str,
+            source_layer: int,
+            entry: Any,
+            _state: Any,
+    ) -> bool:
+        """Record one registration attempt."""
+        self.calls.append((layer_idx, kind, source_layer, id(entry)))
+        return True
+
+
+def test_attention_routes_reads_to_the_plan_only_during_forward():
+    """Each read site reports its kind, source and the entry object itself."""
+    layer, state = _build_layer()
+    plan = _RecordingPlan()
+    layer._state_swap_plan = plan  # pylint: disable=W0212
+    entry = torch.zeros(BATCH, SEQUENCE, RATIO, dtype=torch.int32)
+
+    layer._maybe_swap_state_entry("topk", entry, state)  # pylint: disable=W0212
+    assert plan.calls == [(LAYER, "topk", LAYER, id(entry))]
+
+    plan.calls.clear()
+    _, recompute_context = create_recompute_contexts()
+    with recompute_context:
+        layer._maybe_swap_state_entry("topk", entry, state)  # pylint: disable=W0212
+    assert not plan.calls
+
+
+def test_attention_state_swap_is_a_noop_without_a_plan():
+    """A model that installs no plan never registers anything."""
+    layer, state = _build_layer()
+    entry = torch.zeros(BATCH, SEQUENCE, RATIO, dtype=torch.int32)
+
+    layer._maybe_swap_state_entry("topk", entry, state)  # pylint: disable=W0212
+
+    assert layer._state_swap_plan is None  # pylint: disable=W0212
+
+
+class _SwapRegistration:
+    """Record the entries the plan actually hands to the swap chain."""
+
+    def __init__(self) -> None:
+        """Start with an empty record."""
+        self.tags: list[str] = []
+        self.bytes = 0
+
+    def __call__(self, entry: Any, tag: str) -> bool:
+        """Record one registered entry."""
+        self.tags.append(tag)
+        self.bytes += int(entry.numel() * entry.element_size())
+        return True
+
+
+def test_plan_registers_each_entry_once_and_respects_the_host_budget():
+    """Registration is once per entry, per forward, and bounded in bytes."""
+    policy_module = importlib.import_module(
+        "hyper_parallel.models.deepseek_v41.adapter.policies.shared_state"
+    )
+    plan = policy_module._StateSwapPlan(  # pylint: disable=W0212
+        enabled=True,
+        budget_bytes=8 * 4 * 4,
+        kinds_by_layer={7: frozenset({"topk"}), 9: frozenset({"topk"})},
+    )
+    registration = _SwapRegistration()
+    state = SharedCompressedAttentionState()
+    entry = torch.zeros(8, 4, dtype=torch.float32)
+    with mock.patch.object(policy_module, "_register_swap_entry", registration):
+        assert plan.register(7, "topk", 2, entry, state) is True
+        assert plan.register(7, "topk", 2, entry, state) is False
+        assert plan.register(9, "topk", 8, entry, state) is False
+        assert plan.register(7, "compressed_kv", 2, entry, state) is False
+        assert registration.tags == ["csa2_topk_2"]
+
+        next_state = SharedCompressedAttentionState()
+        assert plan.register(7, "topk", 2, entry, next_state) is True
+    assert registration.tags == ["csa2_topk_2", "csa2_topk_2"]

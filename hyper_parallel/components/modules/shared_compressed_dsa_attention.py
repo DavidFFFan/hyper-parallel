@@ -1173,6 +1173,17 @@ def npu_sparse_attention_with_scalar_sink(
 class SharedCompressedDSAAttentionBase(nn.Module):
     """Shared V4.1 attention semantics with selectable reference execution."""
 
+    # Entry kind -> the attribute naming the layer that published it.
+    _STATE_SWAP_SOURCES = {
+        "compressed_kv": "kv_source_layer_idx",
+        "index_key": "kv_source_layer_idx",
+        "topk": "index_source_layer_idx",
+        "candidate": "candidate_source_layer_idx",
+    }
+    # Installed by the model-owned recompute hook when the swap chain offloads
+    # cross-layer state; ``None`` keeps every entry on device.
+    _state_swap_plan: Any | None = None
+
     def __init__(
             self,
             module: nn.Module,
@@ -1372,6 +1383,24 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 compressed_handle = cp_context.launch(compressed, 1)
         return latent, compressed_handle
 
+    def _maybe_swap_state_entry(self, kind: str, entry: Any, state: Any) -> None:
+        """Hand one published entry to the swap chain if this layer reads it last.
+
+        The entry stays where it is: the swap group of this layer is what
+        offloads it once this forward finishes, and what loads it back before
+        this layer's backward replays the consumer. A replay must not register
+        anything, and a run without swap scheduling has no active group, so both
+        are silent no-ops.
+        """
+        plan = self._state_swap_plan
+        if plan is None or entry is None or is_recomputing():
+            return
+        source_attr = self._STATE_SWAP_SOURCES[kind]
+        source_layer = getattr(self, source_attr, None)
+        if source_layer is None:
+            return
+        plan.register(self.layer_idx, kind, int(source_layer), entry, state)
+
     def _run_indexer(
             self,
             hidden_states: torch.Tensor,
@@ -1392,6 +1421,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             if self.indexer.owns_key
             else shared_state.require_index_key(self.kv_source_layer_idx, self.layer_idx)
         )
+        if index_key is not None:
+            self._maybe_swap_state_entry("index_key", index_key, shared_state)
         candidate_blocks = (
             shared_state.require_candidate_blocks(
                 self.candidate_source_layer_idx,
@@ -1399,6 +1430,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             )
             if self.indexer.uses_candidates else None
         )
+        if candidate_blocks is not None:
+            self._maybe_swap_state_entry("candidate", candidate_blocks, shared_state)
         indexer_output = self.indexer(
             hidden_states,
             query_residual,
@@ -1455,10 +1488,12 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             self.kv_source_layer_idx,
             self.layer_idx,
         )
+        self._maybe_swap_state_entry("compressed_kv", compressed_kv, shared_state)
         topk_indices = shared_state.require_topk_indices(
             self.index_source_layer_idx,
             self.layer_idx,
         )
+        self._maybe_swap_state_entry("topk", topk_indices, shared_state)
         combined_key_value = torch.cat((key_value, compressed_kv.unsqueeze(1)), dim=2)
         compressed_indices = topk_indices.long() + global_sequence_length
         compressed_indices.masked_fill_(topk_indices < 0, -1)

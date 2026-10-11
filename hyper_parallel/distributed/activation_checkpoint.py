@@ -36,7 +36,7 @@ from hyper_parallel.core.activation_memory.swap import (
     SwapManager,
     _teardown_wired_swap_layers,
 )
-from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.models.adapter_spec import RecomputeContext, RecomputePolicy
 from hyper_parallel.models.registry import get_model_adapter
 
 logger = logging.getLogger(__name__)
@@ -972,6 +972,10 @@ def _apply_model_adapter_regions_checkpointing(
     *,
     enable_compile: bool,
     swap_inputs: bool,
+    state_swap: bool = False,
+    state_swap_scope: str = "encoder",
+    state_swap_prefetch_layers: int = 1,
+    state_swap_host_mb: int = 0,
 ) -> nn.Module:
     """Wrap the adapter-declared recompute regions of the selected layers.
 
@@ -1002,17 +1006,32 @@ def _apply_model_adapter_regions_checkpointing(
         )
     excluded_count = _wrap_declared_exclusions(module_by_fqn, roots, recompute_spec)
     wrapped_count = _wrap_region_roots(model, module_by_fqn, roots, checkpoint_kwargs)
-    if swap_inputs and not enable_compile:
+    if (swap_inputs or state_swap) and not enable_compile:
         _register_forward_prefetch_layers(containers)
+    if state_swap:
+        # Every group's load is issued this many layers ahead of its own
+        # backward, which is what lets a large state entry stay off device
+        # through the peak and still be back before its reader replays.
+        SwapManager().set_prefetch_depth(state_swap_prefetch_layers)
     if recompute_spec.on_applied is not None:
-        recompute_spec.on_applied(model)
+        recompute_spec.on_applied(
+            model,
+            RecomputeContext(
+                region_fqns=tuple(root_fqn for root_fqn, _ in roots),
+                state_swap=state_swap,
+                state_swap_scope=state_swap_scope,
+                state_swap_prefetch_layers=state_swap_prefetch_layers,
+                state_swap_host_mb=state_swap_host_mb,
+            ),
+        )
     logger.info(
         "Model-adapter recompute wrapped %d region(s) and excluded %d region(s) "
-        "across %d/%d discovered layers",
+        "across %d/%d discovered layers%s",
         wrapped_count,
         excluded_count,
         len(selected_layer_fqns),
         len(ac_layers),
+        " with cross-layer state swap" if state_swap else "",
     )
     return model
 
@@ -1202,13 +1221,18 @@ def _apply_activation_checkpointing(
     enable_compile: bool = False,
     swap_inputs: bool = False,
     selection: Optional[Any] = None,
+    state_swap: bool = False,
+    state_swap_scope: str = "encoder",
+    state_swap_prefetch_layers: int = 1,
+    state_swap_host_mb: int = 0,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers.
 
     Validates the requested options, discovers the repeated-block containers that
     advertise HuggingFace checkpointing support, then delegates to the
     mode-specific wrapper. Swap prefetch chains are registered afterwards for
-    every configuration that wrapped the layers itself.
+    every configuration that wrapped the layers itself: activation-input swap
+    and cross-layer state swap share the same per-region chain.
     """
     _validate_activation_checkpoint_config(
         activation_checkpoint,
@@ -1228,6 +1252,10 @@ def _apply_activation_checkpointing(
             selection,
             enable_compile=enable_compile,
             swap_inputs=swap_inputs,
+            state_swap=state_swap,
+            state_swap_scope=state_swap_scope,
+            state_swap_prefetch_layers=state_swap_prefetch_layers,
+            state_swap_host_mb=state_swap_host_mb,
         )
 
     if hasattr(model, "gradient_checkpointing_disable"):

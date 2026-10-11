@@ -32,6 +32,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     apply_submodule_checkpointing,
 )
 from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.distributed.attention_swap import validate_attention_swap
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -293,16 +294,56 @@ class TestModelAdapterRecomputeRegions(unittest.TestCase):
     def test_layer_region_calls_model_owned_hook_once(self):
         """The model-owned hook runs after the regions are installed."""
         applied = []
+
+        def _record(model, context):
+            applied.append((model, context))
+
         policy = RecomputePolicy(
             region_patterns=("*decoder.*",),
             exclude_patterns=("*decoder.*.self_attn",),
-            on_applied=applied.append,
+            on_applied=_record,
         )
         model, adapter = self._model(policy)
 
         self._apply(model, adapter, self._selection())
 
-        self.assertEqual(applied, [model])
+        self.assertEqual(len(applied), 1)
+        self.assertIs(applied[0][0], model)
+        self.assertFalse(applied[0][1].state_swap)
+        self.assertTrue(applied[0][1].region_fqns)
+
+    def test_state_swap_installs_the_chain_and_reports_it(self):
+        """A state-swap request wires the chain and reaches the model hook."""
+        applied = []
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            on_applied=lambda model, context: applied.append(context),
+        )
+        model, adapter = self._model(policy)
+
+        with (
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.get_model_adapter", return_value=adapter),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper", new=_checkpoint_wrapper),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}._register_forward_prefetch_layers") as register,
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.SwapManager") as manager,
+        ):
+            _apply_activation_checkpointing(
+                model,
+                "selective",
+                selection=self._selection(),
+                state_swap=True,
+                state_swap_scope="all",
+                state_swap_prefetch_layers=3,
+                state_swap_host_mb=512,
+            )
+
+        register.assert_called_once()
+        manager.return_value.set_prefetch_depth.assert_called_once_with(3)
+        self.assertEqual(len(applied), 1)
+        self.assertTrue(applied[0].state_swap)
+        self.assertEqual(applied[0].state_swap_scope, "all")
+        self.assertEqual(applied[0].state_swap_prefetch_layers, 3)
+        self.assertEqual(applied[0].state_swap_host_mb, 512)
 
     def test_layer_region_requires_region_patterns(self):
         """A policy without region patterns cannot be applied."""
@@ -374,6 +415,52 @@ class TestModelAdapterRecomputeRegions(unittest.TestCase):
             for block in tower.decoder.values():
                 self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
                 self.assertTrue(hasattr(block, "_wrapped_module"))
+
+
+class TestStateSwapValidation(unittest.TestCase):
+    """Guards for the cross-layer state swap mode."""
+
+    def test_state_swap_requires_the_region_path(self):
+        """The mode needs selective recomputation over adapter regions."""
+        validate_attention_swap(
+            "csa2_state",
+            activation_checkpoint="selective",
+            selection_source="model_adapter_safe_regions",
+        )
+        with self.assertRaisesRegex(ValueError, "mode='selective'"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="full",
+                selection_source="model_adapter_safe_regions",
+            )
+        with self.assertRaisesRegex(ValueError, "selection.source"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="selective",
+                selection_source="default",
+            )
+
+    def test_state_swap_rejects_compile_and_pipeline_parallel(self):
+        """Compile and pipeline parallelism break the chain's ordering."""
+        with self.assertRaisesRegex(ValueError, "torch.compile"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="selective",
+                selection_source="model_adapter_safe_regions",
+                enable_compile=True,
+            )
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            validate_attention_swap(
+                "csa2_state",
+                activation_checkpoint="selective",
+                selection_source="model_adapter_safe_regions",
+                pp_size=2,
+            )
+
+    def test_unknown_mode_is_rejected_with_the_full_list(self):
+        """An unknown mode names every supported value."""
+        with self.assertRaisesRegex(ValueError, "csa2_state"):
+            validate_attention_swap("all")
 
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):
