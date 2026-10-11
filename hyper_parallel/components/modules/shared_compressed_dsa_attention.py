@@ -68,23 +68,16 @@ class SharedCompressedAttentionState:
     explicit when activation recomputation revisits modules out of forward
     order.
 
-    ``release_plan`` maps a release layer to the published entries that stop
-    being needed there, and ``release_consumed`` drops exactly those. The plan is
-    derived from the released topology plus the set of layers whose forward runs
-    again during backward (see ``build_shared_state_release_plan``): an entry is
-    released only when every consumer that reads it has finished *and* none of
-    them replays. Entries a replayed consumer reads back are therefore absent
-    from the plan and live until the state itself is dropped, and an entry no
-    consumer ever reads is released at its producer. The schedule is opt-in -
-    it stays empty unless the trainer installed it - so a state without a plan
-    never drops anything early.
+    Nothing drops an entry early. The graph keeps this state for the whole
+    forward-to-backward span and a layer whose forward is replayed reads its
+    entries a second time there, so a published entry has to stay readable until
+    backward is done with every consumer.
     """
 
     compressed_kv_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     index_key_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
-    release_plan: dict[int, tuple[tuple[str, int], ...]] = field(default_factory=dict)
 
     _REGISTRIES: ClassVar[dict[str, str]] = {
         "compressed_kv": "compressed_kv_by_source",
@@ -92,14 +85,6 @@ class SharedCompressedAttentionState:
         "topk": "topk_indices_by_source",
         "candidate": "candidate_blocks_by_source",
     }
-
-    def release_consumed(self, consumer_layer: int) -> None:
-        """Drop the published entries whose final consumer just finished."""
-        dependencies = self.release_plan.get(consumer_layer)
-        if not dependencies:
-            return
-        for kind, source_layer in dependencies:
-            getattr(self, self._REGISTRIES[kind]).pop(source_layer, None)
 
     @staticmethod
     def _require(
@@ -1648,9 +1633,6 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query, combined_key_value, sparse_indices, hidden_states.device
         )
         output = self._project_output(attention_output, cos, sin, batch_size, sequence_length)
-        if not is_recomputing():
-            # A replay must not drop entries that a later replayed consumer reads.
-            shared_state.release_consumed(self.layer_idx)
         return output, None
 
 

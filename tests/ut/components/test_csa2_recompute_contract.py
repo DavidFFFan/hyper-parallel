@@ -17,13 +17,14 @@
 Three mechanisms make a recomputed attention legal, and this module exercises
 them on CPU against the real classes:
 
-* ``is_recomputing()`` phase guards keep ``publish_*`` / ``release_consumed``
-  from running twice. Those calls contain no differentiable op, so skipping
-  them cannot change the checkpoint's saved-tensor count.
+* ``is_recomputing()`` phase guards keep ``publish_*`` from running twice.
+  Those calls contain no differentiable op, so skipping them cannot change the
+  checkpoint's saved-tensor count.
 * the indexer's discrete selection is an exclusion region, because a recompute
   must neither choose a different Top-K set nor drop saved tensors.
-* the release plan is replay aware, so an entry that a recomputed consumer
-  still reads survives into backward.
+* nothing drops a published entry early: a recomputed consumer reads its
+  entries a second time during backward, so they stay alive until the graph
+  releases the state.
 """
 
 from __future__ import annotations
@@ -58,7 +59,6 @@ class _CountingState(SharedCompressedAttentionState):
         """Create the counters used by the assertions."""
         super().__init__(**kwargs)
         self.publish_count = 0
-        self.release_count = 0
         self.topk_count = 0
         self.index_key_count = 0
 
@@ -76,11 +76,6 @@ class _CountingState(SharedCompressedAttentionState):
         """Count one indexer-K publication."""
         self.index_key_count += 1
         super().publish_index_key(source_layer, value)
-
-    def release_consumed(self, consumer_layer: int) -> None:
-        """Count one release pass."""
-        self.release_count += 1
-        super().release_consumed(consumer_layer)
 
 
 class _Compressor(nn.Module):
@@ -270,7 +265,6 @@ def _snapshot(state: _CountingState) -> dict[str, int]:
         "publish_compressed_kv": state.publish_count,
         "publish_topk_indices": state.topk_count,
         "publish_index_key": state.index_key_count,
-        "release_consumed": state.release_count,
     }
 
 
@@ -302,7 +296,7 @@ def _assert_recompute_matches_plain(builder, *, use_cp: bool) -> None:
     assert torch.equal(replayed_grad, plain_grad)
     assert plain_writes == replayed_writes
     # Every write the plain pass performs must happen exactly once under
-    # recompute: the phase guards keep publish/release from running twice.
+    # recompute: the phase guards keep the publishes from running twice.
     assert plain_writes and all(value == 1 for value in plain_writes.values())
     if use_cp:
         # The CP gather is pure, so the recompute re-issues it with the same shapes.
@@ -369,5 +363,3 @@ def test_hook_pins_the_selection_of_replayed_index_sources_only():
     assert model.layers[0].indexer.selection_pinned is True
     assert model.layers[1]._wrapped_module.indexer.selection_pinned is False
     assert model.layers[2].indexer is None
-    assert model.config.v41_release_consumed_shared_state is True
-    assert model.config.v41_replayed_csa2_layers == (2, 25)

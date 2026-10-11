@@ -434,9 +434,9 @@ def build_recompute_policy():
     )
 ```
 
-DeepSeek-V4.1 的 `configure_shared_state` 做三件事：① 把会被重放的层号写进 config，供 replay-aware 释放计划使用——最后一个消费者会重放的条目留到反向；② 把 indexer 的离散选择 pin 成 exclude 区域（重放复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量）；③ 打开释放调度，其中 `publish_*` / `release_consumed` 由 `is_recomputing()` 分相挡住，重放不会写第二次、也不会丢条目。生产 producer 段（compressor、indexer 投影）**不需要** pin：实测把这段留在区域外只多占激活（4096-token crop 上 +0.21 GB）而不带来收益。
+DeepSeek-V4.1 的 `configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域：重放复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——发布出去的条目由 autograd 图持有到反向结束，而 `publish_*` 由 `is_recomputing()` 分相挡住，重放不会写第二次。生产 producer 段（compressor、indexer 投影）**不需要** pin：实测把这段留在区域外只多占激活（4096-token crop 上 +0.21 GB）而不带来收益。
 
-`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它安装选区 pin 与 replay-aware 释放计划）。
+`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重放的层安装选区 pin）。
 
 Trainer recipe 通过通用配置选择该策略：
 
@@ -765,7 +765,7 @@ DeepSeek adapter 的验证声明包括：
 - `compressed_kv`、`index_key`、`topk_indices`、`candidate_blocks` 跨层 publish/consume 检查；
 - packed runtime 字段、视觉输入字段及 vision/aligner 梯度检查；
 - 独立进程中的原生 Engram/MoE/CSA2 前向与反向比较；
-- 整层作为一个区域重算（含 CSA2 attention）：状态写入用 `is_recomputing()` 分相、离散选择 pin 成 exclude 区域、释放计划按"最后一个消费者是否重放"决定。
+- 整层作为一个区域重算（含 CSA2 attention）：状态写入用 `is_recomputing()` 分相，离散选择 pin 成 exclude 区域；跨层条目由 autograd 图持有到反向结束。
 
 DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相替代的：
 

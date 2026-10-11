@@ -23,11 +23,11 @@ from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
 def build_recompute_policy() -> RecomputePolicy:
     """Return the V4.1 recompute regions used by normal training.
 
-    Every decoder layer is one region and every CSA2 layer replays: the shared
-    state keeps the discrete selections and the release schedule, so a replayed
-    layer neither chooses a different key set nor publishes its state twice. The
-    model-owned hook enables both behaviours once the regions are installed, and
-    records which consumers replay so their entries survive into backward.
+    Every decoder layer is one region and every CSA2 layer replays. The
+    model-owned hook then pins each replayed index source's discrete selection as
+    an exclusion region, so a replay neither chooses a different key set nor
+    publishes its state twice; published cross-layer entries simply stay alive
+    until the graph drops the state in backward.
     """
     return RecomputePolicy(
         region_patterns=("model.layers.*",),
