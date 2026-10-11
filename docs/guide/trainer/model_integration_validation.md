@@ -417,7 +417,7 @@ case = ModuleParityCase(
 
 ### 3.4 安全重计算区域
 
-共享跨层状态的 producer/consumer 可以参与重放，但重放路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写状态、释放条目）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重放之外"，并用 `on_applied` 把上面两类动作安装成运行期行为：
+共享跨层状态的 producer/consumer 可以参与重放，但重放路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写跨层状态）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重放之外"，并用 `on_applied` 安装依赖最终区域形状的运行期行为（例如给会被重放的层 pin 选区）：
 
 ```python
 from hyper_parallel.models.adapter_spec import RecomputePolicy
@@ -434,7 +434,7 @@ def build_recompute_policy():
     )
 ```
 
-DeepSeek-V4.1 的 `configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域：重放复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——发布出去的条目由 autograd 图持有到反向结束，而 `publish_*` 由 `is_recomputing()` 分相挡住，重放不会写第二次。生产 producer 段（compressor、indexer 投影）**不需要** pin：实测把这段留在区域外只多占激活（4096-token crop 上 +0.21 GB）而不带来收益。
+DeepSeek-V4.1 的 `configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域：重放复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 由 `is_recomputing()` 分相挡住，重放不会写第二次。生产 producer 段（compressor、indexer 投影）**不需要** pin：实测把这段留在区域外只多占激活（4096-token crop 上 +0.21 GB）而不带来收益。
 
 `region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重放的层安装选区 pin）。
 

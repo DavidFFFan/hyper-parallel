@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Protocol
+from typing import Any, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
@@ -68,23 +68,18 @@ class SharedCompressedAttentionState:
     explicit when activation recomputation revisits modules out of forward
     order.
 
-    Nothing drops an entry early. The graph keeps this state for the whole
-    forward-to-backward span and a layer whose forward is replayed reads its
-    entries a second time there, so a published entry has to stay readable until
-    backward is done with every consumer.
+    Nothing drops an entry early. The state travels into every layer as one of
+    the checkpoint region's inputs, so the graph keeps it alive from the forward
+    pass to the end of backward, and a layer whose forward is replayed reads its
+    entries a second time there. A published entry therefore has to stay
+    readable until backward is done with every consumer, which is also why the
+    publishers skip their write while replaying.
     """
 
     compressed_kv_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     index_key_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
-
-    _REGISTRIES: ClassVar[dict[str, str]] = {
-        "compressed_kv": "compressed_kv_by_source",
-        "index_key": "index_key_by_source",
-        "topk": "topk_indices_by_source",
-        "candidate": "candidate_blocks_by_source",
-    }
 
     @staticmethod
     def _require(
@@ -785,6 +780,11 @@ def shared_compressed_indexer_kl_loss(
 class SharedCompressedDSAIndexer(nn.Module):
     """Reusable V4.1 compressed Lightning Indexer semantics."""
 
+    # Installed by :meth:`enable_selection_exclude` for a replayed layer. The
+    # wrapper sits in a plain container attribute, not in the module tree, so the
+    # exclusion region stays out of ``modules()`` and the state dict.
+    _selection_region: dict[str, Callable[..., Any]] | None = None
+
     def __init__(self, module: nn.Module) -> None:
         """Transfer the source projections without changing checkpoint names."""
         super().__init__()
@@ -901,12 +901,8 @@ class SharedCompressedDSAIndexer(nn.Module):
         different Top-K set, and the selection contains differentiable ops, so
         skipping it would also change how many tensors the checkpoint saves in
         each phase. Everything else in the forward is either recomputed
-        unchanged or guarded by :func:`is_recomputing`: the state writes must
-        not run twice, and the released entries must stay alive until the last
-        recomputed consumer has read them.
-
-        The selection is stored as a plain container so the exclusion wrapper is
-        not registered as a child module of the indexer.
+        unchanged or guarded by :func:`is_recomputing`, so a replay reads the
+        shared entries the forward pass published instead of writing its own.
         """
         self._selection_region = {"wrapper": checkpoint_exclude_wrapper(self._select_tokens)}
 
@@ -922,9 +918,8 @@ class SharedCompressedDSAIndexer(nn.Module):
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select Top-K tokens directly, or through the exclusion region."""
-        region = getattr(self, "_selection_region", None)
-        wrapper = region.get("wrapper") if isinstance(region, dict) else None
-        selection = wrapper if wrapper is not None else self._select_tokens
+        region = self._selection_region
+        selection = self._select_tokens if region is None else region["wrapper"]
         return selection(
             query,
             key,
@@ -1389,7 +1384,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             minimum_key_indices: torch.Tensor | None,
     ) -> Any | None:
-        """Run the indexer on index-source layers and publish its outputs."""
+        """Run the indexer on index-source layers and publish its forward outputs."""
         if not self.is_index_source:
             return None
         index_key = (
@@ -1417,6 +1412,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             minimum_key_indices=minimum_key_indices,
         )
         if is_recomputing():
+            # A replay must not republish: its consumers read the entries the
+            # forward pass wrote, and a second write would break the
+            # single-publisher contract (HP-STATE-002).
             return indexer_output
         if self.indexer.owns_key:
             shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)

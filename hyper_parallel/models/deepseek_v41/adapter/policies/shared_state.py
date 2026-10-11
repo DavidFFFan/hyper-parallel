@@ -24,13 +24,11 @@ def configure_shared_state(model: Any) -> None:
 
     Replayed index-producing layers get their discrete selection turned into an
     exclusion region, because a replay must neither choose a different key set
-    nor change how many tensors the checkpoint sees in each phase. The shared
-    state needs no schedule: every consumer in the shipped policy replays, so
-    entries stay alive until the graph drops the state in backward.
+    nor change how many tensors the checkpoint sees in each phase. The published
+    shared-state entries need no schedule either: the state is an input of every
+    region, so the graph keeps it alive until backward is done with every
+    consumer.
     """
-    config = getattr(model, "config", None)
-    if config is None:
-        return
     for module in _replayed_attentions(model):
         _pin_regions(module)
 
@@ -57,7 +55,13 @@ def _pin_regions(module: Any) -> None:
 
 
 def _replayed_attentions(model: Any) -> list[Any]:
-    """Return the attention modules that run again during backward."""
+    """Return the attention modules whose forward a backward replay revisits.
+
+    The shipped policy makes every decoder layer a region, so the CSA2
+    attentions found under those regions are the ones replay reaches. An
+    attention that an exclusion keeps out of replay is not pinned, because an
+    exclusion region must not nest inside another exclusion region.
+    """
     from hyper_parallel.core.activation_memory.wrapper import (  # pylint: disable=C0415
         CheckpointExcludeWrapper,
     )

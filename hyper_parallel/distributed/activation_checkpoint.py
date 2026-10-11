@@ -902,7 +902,7 @@ def _matches_exclusion(module_fqn: str, module: nn.Module, recompute_spec: Any) 
         for pattern in recompute_spec.exclude_patterns
     ):
         return True
-    predicate = getattr(recompute_spec, "exclude_predicate", None)
+    predicate = recompute_spec.exclude_predicate
     return bool(predicate is not None and predicate(module_fqn, module))
 
 
@@ -1021,8 +1021,7 @@ def _wrap_declared_exclusions(module_by_fqn: dict, roots: list, recompute_spec: 
     """Validate the declared exclusions of the selected regions and wrap them."""
     exclude_targets = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
     declared_exclusions = bool(
-        recompute_spec.exclude_patterns
-        or getattr(recompute_spec, "exclude_predicate", None) is not None
+        recompute_spec.exclude_patterns or recompute_spec.exclude_predicate is not None
     )
     if declared_exclusions and not exclude_targets:
         raise ValueError(
