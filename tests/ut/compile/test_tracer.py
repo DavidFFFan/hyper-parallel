@@ -33,7 +33,6 @@ Running under stock torch (no ``torch.compiler._patch_engine_backward``) still
 captures the joint graph; the patcher warning is suppressed during the trace.
 """
 
-import os
 import unittest
 import warnings
 
@@ -131,7 +130,7 @@ class TestRunTracedGraph(unittest.TestCase):
         x = torch.randn(2, 4)
         y = torch.randn(2, 4)
 
-        joint, loss, grads, _ = _trace_and_run(
+        _, loss, grads, _ = _trace_and_run(
             model,
             lambda m, x, y: ((m(x) - y) ** 2).mean(),
             x,
@@ -232,7 +231,7 @@ class TestTiedWeights(unittest.TestCase):
         x = torch.randint(0, 10, (2, 3))
         y = torch.randn(2, 3, 10)
 
-        joint, loss, grads = _trace_and_run(
+        joint, loss, grads, _ = _trace_and_run(
             model, lambda m, x, y: ((m(x) - y) ** 2).mean(), x, y
         )
         gm = joint.graph_module
