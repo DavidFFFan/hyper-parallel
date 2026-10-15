@@ -95,17 +95,53 @@ def _router(
     return indices, weights
 
 
+def _balanced_router(
+        module: Any,
+        hidden_states: torch.Tensor,
+        image_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep V4.1 routing weights while balancing selected expert indices."""
+    indices, weights = _router(module, hidden_states, image_mask)
+    token_count, experts_per_token = indices.shape
+    expert_count = int(module.gate.num_experts)
+    local_count = int(module.experts.local_expert_count)
+    destinations = expert_count // local_count
+    slots = torch.arange(
+        token_count * experts_per_token,
+        device=indices.device,
+    )
+    balanced = (
+        (slots % destinations) * local_count
+        + (slots // destinations) % local_count
+    )
+    return balanced.view_as(indices).to(indices.dtype), weights
+
+
 def _routed_and_shared_forward(
         module: Any,
         hidden_states: torch.Tensor,
         image_mask: torch.Tensor | None,
         ep_group: Any,
+        *,
+        fix_router: bool = False,
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
+    if fix_router:
+        def router(target_module: Any, target_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            """Apply the benchmark-only balanced V4.1 route."""
+            return _balanced_router(
+                target_module, target_states, image_mask,
+            )
+    else:
+        def router(target_module: Any, target_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            """Apply the learned V4.1 route."""
+            return _router(
+            target_module, target_states, image_mask,
+        )
     routed = ep_routed_forward(
         module,
         hidden_states,
-        router_fn=lambda target_module, target_states: _router(target_module, target_states, image_mask),
+        router_fn=router,
         ep_group=ep_group,
     )
     return routed + module.shared_experts(hidden_states)
@@ -120,8 +156,14 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Any,
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
+        fix_router: bool = False,
 ) -> Callable:
-    """Build the complete V4.1 routed-plus-shared expert forward."""
+    """Build the complete V4.1 routed-plus-shared expert forward.
+
+    ``fix_router=True`` is benchmark-only. It replaces learned expert choices
+    with the existing round-robin balanced router while retaining gate weights.
+    Loss and expert-load metrics are not meaningful in this mode.
+    """
     del mesh, cp_mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
@@ -161,7 +203,9 @@ def deepseek_v41_ep_compute_fn(
                 input_ids: Unused token IDs from the local compute contract.
             """
             del input_ids
-            return _routed_and_shared_forward(module, hidden_states, None, ep_group)
+            return _routed_and_shared_forward(
+                module, hidden_states, None, ep_group, fix_router=fix_router,
+            )
 
         return text_compute_fn
 
@@ -183,7 +227,13 @@ def deepseek_v41_ep_compute_fn(
         local_image_mask = local_token_mask(
             image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
         )
-        return _routed_and_shared_forward(module, hidden_states, local_image_mask, ep_group)
+        return _routed_and_shared_forward(
+            module,
+            hidden_states,
+            local_image_mask,
+            ep_group,
+            fix_router=fix_router,
+        )
 
     return multimodal_compute_fn
 

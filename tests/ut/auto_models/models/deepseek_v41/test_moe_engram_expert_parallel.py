@@ -51,6 +51,7 @@ local_compute_fn:
   _target_: >-
     hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
   use_grouped_gemm: {use_grouped_gemm}
+  fix_router: {fix_router}
 """
 
 
@@ -258,7 +259,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         """The EP factory selects the clamped grouped callable without changing generic EP."""
         experts = DeepseekV4Experts(_expert_config())
         module = SimpleNamespace(
-            gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
+            gate=Mock(), experts=experts, shared_experts=torch.zeros_like, is_hash=False,
             forward=lambda hidden_states, input_ids=None: hidden_states,
         )
         ep_mesh = Mock()
@@ -277,11 +278,15 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         """Typed YAML flags reach the real EP factory for text and VLM contracts."""
         for grouped, multimodal in product((True, False), (False, True)):
             with self.subTest(grouped=grouped, multimodal=multimodal):
-                raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(use_grouped_gemm=str(grouped).lower()))
+                raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(
+                    use_grouped_gemm=str(grouped).lower(),
+                    fix_router="true",
+                ))
                 entry = resolve_component(raw, annotation=PlanOverride, path="$.plan_overrides[0]")
                 spec = entries_to_plan_overrides([entry], ep_size=2)["*.mlp"]
                 self.assertIs(spec.local_compute_fn.callable, deepseek_v41_ep_compute_fn)
                 self.assertIs(spec.local_compute_fn.use_grouped_gemm, grouped)
+                self.assertIs(spec.local_compute_fn.fix_router, True)
                 self.assertIs(spec.region_dispatch, False)
                 module = SimpleNamespace(
                     gate=Mock(), experts=DeepseekV4Experts(_expert_config()), shared_experts=Mock(), is_hash=False,
@@ -305,14 +310,74 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                 with patch(f"{prefix}._routed_and_shared_forward", return_value=states) as routed:
                     output = compute(states, image_mask=mask) if multimodal else compute(states)
                 self.assertIs(output, states)
-                routed.assert_called_once_with(module, states, mask, ep_mesh.get_group.return_value)
+                routed.assert_called_once_with(
+                    module,
+                    states,
+                    mask,
+                    ep_mesh.get_group.return_value,
+                    fix_router=True,
+                )
 
     def test_yaml_override_requires_active_ep(self) -> None:
         """The same parsed EP override is inactive when expert parallelism is off."""
-        raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(use_grouped_gemm="true"))
+        raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(
+            use_grouped_gemm="true",
+            fix_router="false",
+        ))
         entry = resolve_component(raw, annotation=PlanOverride, path="$.plan_overrides[0]")
         self.assertEqual(entries_to_plan_overrides([entry], ep_size=1), {})
         self.assertIn("*.mlp", entries_to_plan_overrides([entry], ep_size=2))
+
+    def test_fixed_router_selects_existing_balanced_adapter(self) -> None:
+        """The benchmark flag preserves V4.1 top-k while balancing destinations."""
+        experts = DeepseekV4Experts(_expert_config())
+        experts.local_expert_count = 2
+        gate = Mock(return_value=(
+            torch.empty(6, 4),
+            torch.rand(6, 3),
+            torch.tensor([
+                [0, 1, 2],
+                [1, 2, 3],
+                [0, 2, 3],
+                [0, 1, 3],
+                [1, 2, 3],
+                [0, 1, 2],
+            ]),
+        ))
+        gate.num_experts = 4
+        module = SimpleNamespace(
+            gate=gate,
+            experts=experts,
+            shared_experts=torch.zeros_like,
+            is_hash=False,
+            forward=lambda hidden_states, input_ids=None: hidden_states,
+        )
+        ep_mesh = Mock()
+        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
+        ep_group = ep_mesh.get_group.return_value
+        states = torch.randn(1, 2, 16)
+        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        compute = deepseek_v41_ep_compute_fn(
+            module=module,
+            mesh=None,
+            tp_mesh=None,
+            cp_mesh=None,
+            ep_mesh=ep_mesh,
+            fix_router=True,
+        )
+        with patch(f"{prefix}.ep_routed_forward", return_value=states) as routed:
+            output = compute(module, states)
+
+        torch.testing.assert_close(output, states)
+        router_fn = routed.call_args.kwargs["router_fn"]
+        indices, weights = router_fn(module, states)
+        self.assertEqual(indices.shape, (6, 3))
+        self.assertEqual(weights.shape, (6, 3))
+        self.assertEqual(
+            torch.bincount(indices.reshape(-1), minlength=4).tolist(),
+            [5, 4, 5, 4],
+        )
+        self.assertIs(routed.call_args.kwargs["ep_group"], ep_group)
 
     def test_eager_path_retains_source_gate(self) -> None:
         """Disabling grouped GEMM still binds the exact clamped eager activation."""
