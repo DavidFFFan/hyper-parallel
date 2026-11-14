@@ -119,12 +119,28 @@ def _register(op_name, kernel):
     return True
 
 
+def _register_host_memory_ops() -> None:
+    """Register fake kernels for host-pinning ops the offload paths call.
+
+    ``aten::_pin_memory`` has no Meta kernel and pinning needs a live device
+    runtime anyway. Logically a pinned mirror is the same host bytes — pinning
+    only changes DMA speed — so the fake kernel returns an ordinary CPU clone.
+    """
+    try:
+        torch.library.register_fake("aten::_pin_memory")(
+            lambda self, device=None: torch.empty_like(self)
+        )
+    except RuntimeError as error:
+        logger.debug("aten::_pin_memory fake kernel already present: %s", error)
+
+
 def register_builtin_dryrun_ops() -> None:
     """Register Meta kernels for vendor forward/backward ops missing them."""
     global _BUILTINS_REGISTERED  # pylint: disable=global-statement
     if _BUILTINS_REGISTERED:
         return
     _BUILTINS_REGISTERED = True
+    _register_host_memory_ops()
     if getattr(torch.ops, "custom", None) is None:
         return
 

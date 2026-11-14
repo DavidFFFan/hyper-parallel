@@ -129,10 +129,14 @@ class TestDryRunConfiguration(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "PEFT"):
             HyperModelsDryRunRunner(config, runtime)._validate_config()
 
+        # Offload and swap features simulate: their storage lifecycle is
+        # host-ordered (resize_(0) on wait_offload, resize_ + copy on load),
+        # so validation accepts them.
         config = _config()
         config.activation_swap = "attention"
-        with self.assertRaisesRegex(NotImplementedError, "does not simulate activation swap"):
-            HyperModelsDryRunRunner(config, runtime)._validate_config()
+        config.fsdp_config.enable_offload = True
+        config.optimizer.swap.enabled = True
+        HyperModelsDryRunRunner(config, runtime)._validate_config()
 
         config = _config()
         config.accelerator.pp_size = 2

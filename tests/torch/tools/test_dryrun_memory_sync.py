@@ -50,11 +50,21 @@ _ASSET_ENV = {
 }
 
 #: Scenario matrix: (name, extra CLI overrides). The base recipe is EP8/FSDP8.
+#: The offload/swap scenarios exercise the host-ordered storage lifecycle
+#: (resize_(0) on wait_offload, resize_ + copy on load) through the same
+#: census: a missed release or restore shows up as a device-side count skew.
 _SCENARIOS = (
     ("cp2_ep4_fsdp4", (
         "--accelerator.cp_size=2",
         "--accelerator.ep_size=4",
         "--fsdp_config.dp_shard_size=4",
+    )),
+    ("fsdp_cpu_offload", (
+        "--fsdp_config.enable_offload=true",
+    )),
+    ("attention_swap", (
+        "--activation_swap=attention",
+        "--activation_checkpoint.mode=off",
     )),
 )
 

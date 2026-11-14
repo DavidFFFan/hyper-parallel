@@ -200,6 +200,50 @@ class TestLogicalMemoryTracker(unittest.TestCase):
                 raise RuntimeError("abort")
         self.assertIs(torch.UntypedStorage.resize_, previous_resize)
 
+    def test_offload_trades_device_bytes_for_host_ledger_bytes(self):
+        """A D2H offload mirror lands on the host ledger, not the device peak.
+
+        This is the storage story of CPU offload and swap: the device storage
+        is released via ``resize_(0)`` after the copy, the pinned host mirror
+        stays alive. The accelerator summary must show the release while the
+        host ledger carries the mirror — neither side inflating the other.
+        """
+        with FakeTensorMode(), LogicalMemoryTracker("cuda") as tracker:
+            device_tensor = torch.empty(1024, device="cuda")
+            tracker.track([device_tensor])
+            host_mirror = torch.empty_like(device_tensor, device="cpu")
+            host_mirror.copy_(device_tensor, non_blocking=True)
+            device_tensor.untyped_storage().resize_(0)
+            snapshot = tracker.snapshot()
+
+        self.assertEqual(snapshot["summary"]["current_bytes"], 0)
+        self.assertEqual(snapshot["summary"]["peak_bytes"], 4096)
+        self.assertEqual(snapshot["summary"]["host_current_bytes"], 4096)
+        self.assertEqual(snapshot["summary"]["host_peak_bytes"], 4096)
+        self.assertNotIn("host", snapshot["summary"]["devices"])
+        # Host events never leak into the native device_traces keys.
+        host_actions = [event["action"] for event in snapshot["host"]["trace"]]
+        self.assertIn("alloc", host_actions)
+        self.assertEqual(len(snapshot["host"]["segments"]), 1)
+        self.assertEqual(snapshot["host"]["segments"][0]["total_size"], 4096)
+
+    def test_host_ledger_ignores_real_cpu_process_state(self):
+        """Real CPU tensors (probed batch, host scalars) are not step allocations."""
+        real_cpu = torch.empty(256)
+        with FakeTensorMode(allow_non_fake_inputs=True), LogicalMemoryTracker("cuda") as tracker:
+            tracker.track([real_cpu])
+            snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["summary"]["host_current_bytes"], 0)
+
+    def test_cpu_simulation_keeps_single_ledger(self):
+        """When simulating on cpu, cpu storages are the device story itself."""
+        with FakeTensorMode(), LogicalMemoryTracker("cpu") as tracker:
+            tensor = torch.empty(64)
+            tracker.track([tensor])
+            snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["summary"]["current_bytes"], 256)
+        self.assertEqual(snapshot["summary"]["host_current_bytes"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

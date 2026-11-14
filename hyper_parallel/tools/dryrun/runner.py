@@ -182,17 +182,10 @@ class HyperModelsDryRunRunner:
                 None,
         ) not in (False, None, "off", "none"):
             raise NotImplementedError("LLM Dry-run does not support FSDP activation checkpointing")
-        if self.config.fsdp_config.enable_offload:
-            raise NotImplementedError("LLM Dry-run does not support CPU offload")
         if self.config.peft is not None:
             raise NotImplementedError("LLM Dry-run does not support PEFT model mutation")
         if self.config.compile.enabled:
             raise NotImplementedError("LLM Dry-run does not support torch.compile")
-        if self.config.activation_swap != "none":
-            raise NotImplementedError(
-                "LLM Dry-run does not simulate activation swap because FakeTensor "
-                "cannot reproduce asynchronous host offload and stream lifetimes"
-            )
         torch_dry_run._DryRunValueProfile(dry_run)  # pylint: disable=protected-access
         self._validate_topology()
         if self.config.accelerator.pp_size != 1:
@@ -978,10 +971,6 @@ class HyperModelsDryRunRunner:
         """Execute one fake step, write the rank-local pickle, and return its snapshot."""
         dry_run = self._validate_config()
         runtime = self._get_runtime()
-        # The real Trainer step loop runs over FakeTensors: silence every
-        # device-side effect (set_device/synchronize/empty_cache and allocator
-        # history) so simulation never binds or initializes an accelerator.
-        simulate_device_runtime(True)
         memory_profiler_module.memory_profiler.reset(
             None, global_rank=runtime.rank, tp_rank=0, dp_rank=0,
         )
@@ -992,6 +981,23 @@ class HyperModelsDryRunRunner:
         snapshot_path = self._snapshot_path(dry_run, runtime)
         target_device = self._resolve_target_device()
         self._simulation_device = self._select_simulation_device(target_device)
+        # The real Trainer step loop runs over FakeTensors: silence every
+        # device-side effect (set_device/synchronize/empty_cache, allocator
+        # history, swap streams and events) so simulation never binds or
+        # initializes an accelerator. Components that stage collectives
+        # consult the lied accelerator so their buffers land where real
+        # runs put them.
+        simulate_device_runtime(
+            True,
+            accelerator=None if self._simulation_device == "cpu" else self._simulation_device,
+        )
+        # The FakeTensor dispatch cache pins op-output storages inside its
+        # keys. Harmless for shape checking, but this tracker equates storage
+        # lifetime with PyObject lifetime, so a cached entry would keep a
+        # released activation "live" (observed with activation swap: resized
+        # storages stayed pinned by _DispatchCacheKey). Simulation disables
+        # the cache; correctness of lifetimes outranks dispatch speed here.
+        torch._dynamo.config.fake_tensor_cache_enabled = False  # pylint: disable=protected-access
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
         batch = self._probe_training_batch(runtime, fake_mode)
         return self._run_simulation(runtime, dry_run, batch, fake_mode, snapshot_path)

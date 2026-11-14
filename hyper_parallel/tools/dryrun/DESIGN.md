@@ -182,6 +182,41 @@ directly. This works for real tensors and FakeTensors. `data_ptr()` is not used
 because FakeTensors have no physical address and can return identical zero
 values for independent storages (empty shards behave the same way).
 
+## Offload and Swap Simulation
+
+CPU offload and swap features trade device bytes for host bytes, and their
+storage lifecycle is entirely host-ordered: device memory is released by
+`untyped_storage().resize_(0)` inside `wait_offload`, and restored by
+`resize_(nbytes)` plus a copy inside `launch_load`/`prefetch` — all called
+from Python hooks in a fixed order. Stream events only decide how much the
+transfers overlap compute, never which bytes are live, so the logical tracker
+reproduces the lifecycle exactly. Three features simulate on this basis:
+
+- **FSDP CPU offload** (`fsdp_config.enable_offload`): sharded params and
+  reduced grads live on host; each all-gather stages a transient device copy.
+- **Optimizer-state swap** (`optimizer.swap.enabled`): state tensors mirror
+  to pinned host memory between updates, with two device staging arenas.
+- **Activation swap** (`activation_swap: attention`): per-layer attention
+  activations offload after forward and prefetch before backward.
+
+The components reach their stream/event primitives through seams
+(`core/utils/simulation.py`): under simulation the seams answer with
+immediate-completion stand-ins, so the unmodified swap state machines run in
+host program order without binding an accelerator. Host-side pinning
+degrades to ordinary CPU allocations (pinning changes DMA speed, not bytes).
+
+The snapshot gains a host ledger: fake CPU storages the step allocates
+(offload mirrors, swapped state) are accounted under the `host` key and
+`summary.host_peak_bytes`, separate from the native device keys, so a plan
+reads both sides of the trade — device bytes saved and pinned host bytes
+spent. Real CPU tensors that pre-exist the step (the probed batch) stay out.
+
+What is not reproduced is, as everywhere else, only device-side overlap: a
+real run may briefly hold both the device storage and its in-flight host
+copy across an asynchronous boundary that simulation collapses to program
+order. Measured against the 8-die validation crop, the FSDP-offload logical
+peak matches the real trace peak to within 0.1%.
+
 ## Snapshot Semantics
 
 Each live storage produces a logical synthetic segment. The tracker records
@@ -196,21 +231,20 @@ requested storage bytes and native-style alloc/free events. It does not simulate
   **is** reproduced, because the real scheduler code runs; only the
   kernel-time interleaving on device streams is out of scope).
 - HCCL/NCCL persistent allocations.
-- Activation swap host/device lifetimes.
 
 The resulting peak is a logical capacity estimate, not a reservation guarantee.
 Measured against 8-die DeepSeek-V4.1 validation crops, the logical peak lands
-at 94–100% of the real trace-level peak across EP/FSDP/TP+SP/CP mixes.
+at 94–100% of the real trace-level peak across EP/FSDP/TP+SP/CP mixes, and at
+100–102% across the offload/swap scenarios.
 
 ## Unsupported Scope
 
 The current implementation rejects:
 
-- Pipeline parallelism.
-- CPU offload.
+- Pipeline parallelism (the eager trainer has no PP path yet; dry-run will
+  follow once it does).
 - PEFT mutation.
 - `torch.compile`.
-- Activation swap.
 
 Dry-run must fail fast when a configuration requests behavior whose memory
 lifetime cannot be represented by the current logical tracker.

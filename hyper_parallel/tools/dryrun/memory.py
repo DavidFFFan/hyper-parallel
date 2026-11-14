@@ -47,7 +47,15 @@ class LogicalMemoryTracker(TorchDispatchMode):
     Note:
         Segments are synthetic, one per live allocation. There is no caching,
         fragmentation, workspace, or asynchronous stream simulation.
+        When the simulated device is an accelerator, fake CPU storages the
+        step allocates (offload mirrors, swapped optimizer state) are
+        accounted on a separate host ledger: offload features trade device
+        bytes for host bytes, and pinned host memory is its own capacity
+        limit. Real CPU tensors (the probed data batch, host scalars) are
+        process state, not step allocations, and stay out of the ledger.
     """
+
+    _HOST_DEVICE = "host"
 
     def __init__(
             self,
@@ -70,8 +78,9 @@ class LogicalMemoryTracker(TorchDispatchMode):
         self._allocations: dict[int, dict[str, Any]] = {}
         self._storage_refs: dict[int, Any] = {}
         self._traces: list[list[dict[str, Any]]] = []
-        self._current: dict[int, int] = {}
-        self._peaks: dict[int, int] = {}
+        self._host_trace: list[dict[str, Any]] = []
+        self._current: dict[Any, int] = {}
+        self._peaks: dict[Any, int] = {}
         self._peak_bytes = 0
         self._next_address = _ADDRESS_BASE
         self._previous_resize = None
@@ -127,9 +136,13 @@ class LogicalMemoryTracker(TorchDispatchMode):
 
     def _event(self, action: str, allocation: dict[str, Any]) -> None:
         device = allocation["device"]
-        while len(self._traces) <= device:
-            self._traces.append([])
-        self._traces[device].append({
+        if device == self._HOST_DEVICE:
+            trace = self._host_trace
+        else:
+            while len(self._traces) <= device:
+                self._traces.append([])
+            trace = self._traces[device]
+        trace.append({
             "action": action,
             "addr": allocation["address"],
             "size": allocation["size"],
@@ -182,7 +195,14 @@ class LogicalMemoryTracker(TorchDispatchMode):
         self._event("alloc", allocation)
         self._current[device] = self._current.get(device, 0) + size
         self._peaks[device] = max(self._peaks.get(device, 0), self._current[device])
-        self._peak_bytes = max(self._peak_bytes, sum(self._current.values()))
+        self._peak_bytes = max(self._peak_bytes, self._accelerator_current_bytes())
+
+    def _accelerator_current_bytes(self) -> int:
+        """Return live bytes on the simulated accelerator, excluding the host ledger."""
+        return sum(
+            current for device, current in self._current.items()
+            if device != self._HOST_DEVICE
+        )
 
     def track(self, tensors: Iterable[torch.Tensor]) -> None:
         """Register existing tensors without retaining them or their storages.
@@ -193,11 +213,22 @@ class LogicalMemoryTracker(TorchDispatchMode):
         if not self._recording:
             raise RuntimeError("Enter LogicalMemoryTracker before registering tensors")
         for tensor in tensors:
-            if tensor.device.type != self.device_type:
+            if tensor.device.type == self.device_type:
+                device = tensor.device.index
+                if device is None:
+                    device = self.device_index
+            elif (
+                    tensor.device.type == "cpu"
+                    and self.device_type != "cpu"
+                    and hasattr(tensor, "fake_mode")
+            ):
+                # A fake CPU storage is one the simulated step itself
+                # allocated — an offload mirror, a swapped optimizer mirror,
+                # or a host scalar. Real CPU tensors (the probed batch) are
+                # pre-existing process state and stay untracked.
+                device = self._HOST_DEVICE
+            else:
                 continue
-            device = tensor.device.index
-            if device is None:
-                device = self.device_index
             for storage in get_untyped_storages(tensor):
                 self._observe_storage(storage, device)
 
@@ -228,11 +259,12 @@ class LogicalMemoryTracker(TorchDispatchMode):
             simulation assumptions. Event list order is the logical timeline.
         """
         segments = []
+        host_segments = []
         for allocation in self._allocations.values():
             size = allocation["size"]
             if size == 0:
                 continue
-            segments.append({
+            segment = {
                 "device": allocation["device"],
                 "address": allocation["address"],
                 "total_size": size,
@@ -251,18 +283,35 @@ class LogicalMemoryTracker(TorchDispatchMode):
                     "state": "active_allocated",
                     "frames": allocation["frames"],
                 }],
-            })
+            }
+            if allocation["device"] == self._HOST_DEVICE:
+                segment["device"] = 0
+                host_segments.append(segment)
+            else:
+                segments.append(segment)
         # Copies isolate saved snapshots from subsequent events and releases.
         return copy.deepcopy({
             "segments": sorted(segments, key=lambda segment: (segment["device"], segment["address"])),
             "device_traces": self._traces,
+            # Host-side storages the simulated step allocated (offload mirrors,
+            # swapped state). Kept out of the native keys so accelerator
+            # tooling reads the device story unchanged.
+            "host": {
+                "segments": sorted(host_segments, key=lambda segment: segment["address"]),
+                "trace": self._host_trace,
+                "current_bytes": self._current.get(self._HOST_DEVICE, 0),
+                "peak_bytes": self._peaks.get(self._HOST_DEVICE, 0),
+            },
             "summary": {
-                "current_bytes": sum(self._current.values()),
+                "current_bytes": self._accelerator_current_bytes(),
                 "peak_bytes": self._peak_bytes,
                 "peak_gib": self._peak_bytes / 2 ** 30,
+                "host_current_bytes": self._current.get(self._HOST_DEVICE, 0),
+                "host_peak_bytes": self._peaks.get(self._HOST_DEVICE, 0),
                 "devices": {
                     device: {"current_bytes": current_bytes, "peak_bytes": self._peaks[device]}
                     for device, current_bytes in self._current.items()
+                    if device != self._HOST_DEVICE
                 },
             },
             "simulation": {

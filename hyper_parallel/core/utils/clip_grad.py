@@ -49,6 +49,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import Partial
+from hyper_parallel.core.utils import simulation
 
 if TYPE_CHECKING:
     from hyper_parallel.core.dtensor.layout import Layout
@@ -219,7 +220,7 @@ def dense_grad_norm_sq_and_refs(model: torch.nn.Module,
     for name in getattr(getattr(mesh_context, "device_mesh", None), "mesh_dim_names", ()) or ():
         axis = mesh_context.device_mesh[name]
         if axis.size() > 1:
-            dist.all_reduce(local_sq, op=dist.ReduceOp.SUM, group=axis.get_group())
+            _all_reduce_scalar(local_sq, dist.ReduceOp.SUM, axis.get_group())
     return local_sq, refs
 
 
@@ -319,6 +320,34 @@ def _param_device(param: torch.Tensor) -> torch.device:
     if _is_dtensor(param):
         return param._local_tensor.device  # pylint: disable=protected-access
     return param.device
+
+
+def _all_reduce_scalar(scalar: torch.Tensor, reduce_op, group) -> torch.Tensor:
+    """All-reduce a norm scalar on a device the group's backend supports.
+
+    With CPU offload the gradients — and therefore the local norm scalar —
+    live on host, while the process group is an accelerator backend
+    (HCCL/NCCL) with no CPU path. The scalar is staged on the backend's
+    device for the collective and brought back, which preserves the caller's
+    device so subsequent arithmetic stays where the gradients are.
+    """
+    try:
+        backend = dist.get_backend(group)
+    except (ValueError, RuntimeError):
+        # Test doubles answer every device; reduce in place.
+        backend = None
+    backend_device = {"hccl": "npu", "nccl": "cuda"}.get(backend)
+    if backend_device is None and backend == "fake":
+        # Logical simulation: stage where a real run would, so the simulated
+        # allocation story matches the accelerator run byte for byte.
+        backend_device = simulation.simulated_accelerator()
+    if backend_device is None or scalar.device.type == backend_device:
+        dist.all_reduce(scalar, op=reduce_op, group=group)
+        return scalar
+    staged = scalar.to(backend_device)
+    dist.all_reduce(staged, op=reduce_op, group=group)
+    scalar.copy_(staged)
+    return scalar
 
 
 def _get_grad_obj(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
@@ -608,10 +637,7 @@ def _total_norm_inf(  # pylint: disable=R0913,R0917
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_norm, op=reduce_op,
-                    group=mesh.get_group(dim),
-                )
+                _all_reduce_scalar(local_norm, reduce_op, mesh.get_group(dim))
         group_norms.append(local_norm)
     if not group_norms:
         if norm_type == -math.inf:
@@ -629,10 +655,7 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_val, op=dist.ReduceOp.SUM,
-                    group=mesh.get_group(dim),
-                )
+                _all_reduce_scalar(local_val, dist.ReduceOp.SUM, mesh.get_group(dim))
         total.add_(local_val)
     return total
 
@@ -732,7 +755,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
             local_p = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for group in sig_groups[sig]:
-            dist.all_reduce(local_p, op=dist.ReduceOp.SUM, group=group)
+            _all_reduce_scalar(local_p, dist.ReduceOp.SUM, group)
 
         total_p = total_p + local_p
 
