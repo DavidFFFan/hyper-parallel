@@ -39,6 +39,7 @@ from torch import Tensor
 
 from hyper_parallel.core.utils.communication import get_device_handle
 from hyper_parallel.core.utils.simulation import (
+    hold_for_simulated_stream,
     is_device_runtime_simulated,
     simulated_device_handle,
 )
@@ -78,8 +79,15 @@ def new_event():
 
 
 def record_stream(tensor, stream) -> None:
-    """Reserve ``tensor``'s storage for ``stream`` until its pending work ends."""
+    """Reserve ``tensor``'s storage for ``stream`` until its pending work ends.
+
+    Under simulation the reference is held until the next simulated wait —
+    the same point a real caching allocator could first reclaim it — so the
+    logical lifetime of staging buffers is conservative, never shorter than
+    the real one.
+    """
     if is_device_runtime_simulated():
+        hold_for_simulated_stream(tensor)
         return
     tensor.record_stream(stream)
 

@@ -21,6 +21,12 @@ as parameters, gradients, optimizer state, activations, forward, backward, or
 recompute. The snapshot follows the `segments` and `device_traces` shape used by
 PyTorch memory visualization.
 
+**Process-lifetime contract**: dry-run owns the process. It installs
+process-local compatibility patches, enables the simulated device runtime, and
+disables the FakeTensor dispatch cache for the remainder of the process. The
+supported model is invoke → simulate → write snapshots → exit; running normal
+training in the same process afterward is outside the contract.
+
 ## Package Layout
 
 All dry-run implementation lives under `hyper_parallel/tools/dryrun`:
@@ -204,12 +210,29 @@ The components reach their stream/event primitives through seams
 immediate-completion stand-ins, so the unmodified swap state machines run in
 host program order without binding an accelerator. Host-side pinning
 degrades to ordinary CPU allocations (pinning changes DMA speed, not bytes).
+One refinement keeps staging lifetimes conservative:
+
+- **Stream holds**: the `record_stream` stand-in retains the staging buffer
+  reference until the next simulated event wait or stream synchronize — the
+  same point a real caching allocator could first reclaim it — so logical
+  staging lifetimes are never shorter than real ones, without modeling
+  stream timing.
 
 The snapshot gains a host ledger: fake CPU storages the step allocates
 (offload mirrors, swapped state) are accounted under the `host` key and
 `summary.host_peak_bytes`, separate from the native device keys, so a plan
 reads both sides of the trade — device bytes saved and pinned host bytes
 spent. Real CPU tensors that pre-exist the step (the probed batch) stay out.
+The reconciliation ST asserts both sides: the device census against the real
+trace, and the host ledger's coverage of the device saving against the
+baseline scenario (the host side has no real counterpart trace).
+
+Known limit: under CPU-fallback simulation (no accelerator backend on the
+planning host) device and host tensors share one fake device, so host
+mirrors land on the device ledger and `host_peak_bytes` stays zero. This is
+accepted: the fallback exists for coarse capacity planning, host RAM is
+rarely the binding constraint, and exact offload/swap accounting is one
+accelerator-lying run away.
 
 What is not reproduced is, as everywhere else, only device-side overlap: a
 real run may briefly hold both the device storage and its in-flight host

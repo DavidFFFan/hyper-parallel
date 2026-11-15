@@ -35,8 +35,11 @@ from typing import Any
 #: Blocks below this size are noise for divergence hunting.
 LARGE_BLOCK_BYTES = 32 * 2**20
 
-#: Logical peak must stay within this band of the real trace peak.
-PEAK_RATIO_BAND = (0.80, 1.10)
+#: Logical peak must stay within this band of the real trace peak. Measured
+#: anchors on the validation crop: CP2 0.94 (value-dependent CSA2 interleave),
+#: everything else 0.98–1.02. The band keeps modest headroom without
+#: accepting the silent 10–20% skew the previous (0.80, 1.10) band allowed.
+PEAK_RATIO_BAND = (0.90, 1.05)
 
 #: Value-dependency replay owns these modules: their tensor sizes depend on
 #: runtime values (document boundaries, routing loads) that dry-run replays
@@ -169,3 +172,46 @@ def _estimate_real_steps(dry_census: Counter, real_census: Counter) -> int:
     if not ratios:
         return 1
     return max(ratios.most_common(1)[0][0], 1)
+
+
+#: Host-ledger tolerance: the simulated host bytes must cover at least this
+#: fraction of the expected host footprint derived from the scenario's device
+#: saving (host mirrors are what the device bytes were traded for).
+HOST_COVERAGE_MIN = 0.5
+
+
+def check_offload_trade(
+        scenario_snapshot: dict[str, Any],
+        baseline_snapshot: dict[str, Any],
+) -> list[str]:
+    """Assert the device/host trade an offload or swap scenario must show.
+
+    The reconciliation census proves the device story matches the real run;
+    this check covers the other half of capacity planning, which has no real
+    counterpart trace: the host ledger must actually carry the bytes the
+    device saved (within :data:`HOST_COVERAGE_MIN`, since padding, dtype
+    casts, and transient staging legitimately skew the two sides).
+    """
+    problems: list[str] = []
+    scenario = scenario_snapshot["summary"]
+    baseline = baseline_snapshot["summary"]
+    host_peak = int(scenario.get("host_peak_bytes", 0))
+    device_saving = int(baseline["peak_bytes"]) - int(scenario["peak_bytes"])
+    if host_peak <= 0:
+        problems.append(
+            "offload/swap scenario reports an empty host ledger — host"
+            " mirrors were misclassified onto the device account"
+        )
+    if device_saving < 0 and scenario["peak_bytes"] > baseline["peak_bytes"] * 1.02:
+        problems.append(
+            f"offload/swap scenario device peak {scenario['peak_bytes']}"
+            f" exceeds baseline {baseline['peak_bytes']} — the feature did"
+            " not reduce (or hold) the device footprint"
+        )
+    if device_saving > 0 and host_peak < device_saving * HOST_COVERAGE_MIN:
+        problems.append(
+            f"host ledger {host_peak} covers less than"
+            f" {HOST_COVERAGE_MIN:.0%} of the device saving {device_saving}"
+            " — host accounting is undercounting the trade"
+        )
+    return problems

@@ -14,12 +14,18 @@
 # ============================================================================
 """Unit tests for the device-runtime simulation switch and stand-ins."""
 import unittest
+import weakref
+
+import torch
 
 from hyper_parallel.core.utils.simulation import (
     SimulatedEvent,
     SimulatedStream,
+    hold_for_simulated_stream,
     is_device_runtime_simulated,
+    release_simulated_stream_holds,
     simulate_device_runtime,
+    simulated_accelerator,
     simulated_device_handle,
 )
 
@@ -37,6 +43,44 @@ class TestSimulationSwitch(unittest.TestCase):
         self.assertTrue(is_device_runtime_simulated())
         simulate_device_runtime(False)
         self.assertFalse(is_device_runtime_simulated())
+
+    def test_accelerator_lie_round_trip(self):
+        """The lied accelerator is readable while enabled and cleared after."""
+        simulate_device_runtime(True, accelerator="npu")
+        self.assertEqual(simulated_accelerator(), "npu")
+        simulate_device_runtime(False)
+        self.assertIsNone(simulated_accelerator())
+
+    def test_stream_hold_keeps_tensor_until_wait(self):
+        """record_stream stand-in retains the staging buffer until a wait.
+
+        A real caching allocator keeps a record_stream'd buffer alive past
+        the last Python reference until the stream's pending work completes;
+        the conservative stand-in mirrors that by holding the reference until
+        the next simulated synchronization point.
+        """
+        simulate_device_runtime(True)
+        try:
+            tensor = torch.empty(16)
+            ref = weakref.ref(tensor)
+            hold_for_simulated_stream(tensor)
+            del tensor
+            self.assertIsNotNone(ref(), "hold must outlive the last reference")
+            SimulatedEvent().wait()
+            self.assertIsNone(ref(), "wait must release the hold")
+        finally:
+            simulate_device_runtime(False)
+
+    def test_disable_clears_pending_holds(self):
+        """Turning simulation off never leaks held references across runs."""
+        simulate_device_runtime(True)
+        tensor = torch.empty(8)
+        ref = weakref.ref(tensor)
+        hold_for_simulated_stream(tensor)
+        del tensor
+        simulate_device_runtime(False)
+        self.assertIsNone(ref())
+        release_simulated_stream_holds()
 
 
 class TestSimulatedPrimitives(unittest.TestCase):

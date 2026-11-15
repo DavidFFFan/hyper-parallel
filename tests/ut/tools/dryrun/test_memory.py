@@ -236,7 +236,13 @@ class TestLogicalMemoryTracker(unittest.TestCase):
         self.assertEqual(snapshot["summary"]["host_current_bytes"], 0)
 
     def test_cpu_simulation_keeps_single_ledger(self):
-        """When simulating on cpu, cpu storages are the device story itself."""
+        """When simulating on cpu, cpu storages are the device story itself.
+
+        Known limit (documented in DESIGN.md): under CPU-fallback simulation
+        host mirrors share this single ledger too — the fallback is for
+        coarse planning; exact offload/swap accounting needs the
+        accelerator-lying run.
+        """
         with FakeTensorMode(), LogicalMemoryTracker("cpu") as tracker:
             tensor = torch.empty(64)
             tracker.track([tensor])

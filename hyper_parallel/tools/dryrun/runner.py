@@ -603,7 +603,9 @@ class HyperModelsDryRunRunner:
             module for module in model.modules()
             if hasattr(module, "hsdp_scheduler")
         ]
-        from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime  # pylint: disable=C0415
+        from hyper_parallel.trainer.runtime import (  # pylint: disable=C0415
+            model_integration as model_integration_runtime,
+        )
         base.model_integration = model_integration_runtime.build_model_integration_session(
             base.model, base.config, base.global_rank, base.mesh,
         )

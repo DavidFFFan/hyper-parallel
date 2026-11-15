@@ -86,6 +86,7 @@ class LogicalMemoryTracker(TorchDispatchMode):
         self._previous_resize = None
         self._recording = False
         self._stack_cache: dict[tuple, list[dict[str, Any]]] = {}
+        self._host_mark_observer = None
 
     def __enter__(self) -> "LogicalMemoryTracker":
         """Start dispatch tracking and observe direct storage resizes."""
@@ -164,13 +165,16 @@ class LogicalMemoryTracker(TorchDispatchMode):
         self._event("segment_free", allocation)
         self._current[allocation["device"]] -= allocation["size"]
 
-    def _observe_storage(self, storage: Any, device: int) -> None:
+    def _observe_storage(self, storage: Any, device: Any) -> None:
         key = int(storage._cdata)  # pylint: disable=protected-access
         size = int(storage.nbytes())
         allocation = self._allocations.get(key)
         if allocation is not None:
-            if allocation["size"] == size:
+            if allocation["size"] == size and allocation["device"] == device:
                 return
+            # A size change is a reallocation; a device change migrates the
+            # ledger (a storage first seen as device, then marked host by an
+            # offload seam, must not stay on the device account).
             self._release(key)
         tracker_ref = weakref.ref(self)
 
@@ -214,7 +218,7 @@ class LogicalMemoryTracker(TorchDispatchMode):
             raise RuntimeError("Enter LogicalMemoryTracker before registering tensors")
         for tensor in tensors:
             if tensor.device.type == self.device_type:
-                device = tensor.device.index
+                device: Any = tensor.device.index
                 if device is None:
                     device = self.device_index
             elif (
@@ -226,6 +230,14 @@ class LogicalMemoryTracker(TorchDispatchMode):
                 # allocated — an offload mirror, a swapped optimizer mirror,
                 # or a host scalar. Real CPU tensors (the probed batch) are
                 # pre-existing process state and stay untracked.
+                #
+                # Known limit: under CPU-fallback simulation (device_type ==
+                # "cpu") device and host share one fake device, so host
+                # mirrors land on the device ledger and host_peak_bytes
+                # stays zero. Accepted: the fallback exists for coarse
+                # capacity planning without the accelerator's torch build,
+                # and host RAM is rarely the binding constraint. Use an
+                # accelerator-lying run for exact offload/swap accounting.
                 device = self._HOST_DEVICE
             else:
                 continue

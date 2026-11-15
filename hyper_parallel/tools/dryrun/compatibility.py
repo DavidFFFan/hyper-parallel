@@ -38,6 +38,29 @@ _MUON_LAYOUT_STAGE_STATE: ContextVar[Any] = ContextVar(
     default=None,
 )
 _INSTALLED = False
+# Model-specific environment patches, registered by example/plugin modules at
+# import time (same contract as value-dependency handlers). The generic
+# compatibility layer never imports model-specific code; the dependency
+# direction is plugins -> dry-run adapters, not the reverse.
+_ENVIRONMENT_PATCHES: dict[str, Any] = {}
+_ENVIRONMENT_PATCHES_INSTALLED: set[str] = set()
+
+
+def register_environment_patch(name: str, installer: Any) -> None:
+    """Register a model-specific process-local patch for dry-run environments.
+
+    Args:
+        name: Unique patch identity, e.g. ``"deepseek_v41.csa2"``.
+        installer: Zero-argument callable applying the patch idempotently.
+    """
+    if not callable(installer):
+        raise TypeError("environment patch installer must be callable")
+    _ENVIRONMENT_PATCHES[name] = installer
+    # A patch registered after install_dryrun_compatibility (import order is
+    # the plugin's choice) still has to take effect for this process.
+    if _INSTALLED and name not in _ENVIRONMENT_PATCHES_INSTALLED:
+        installer()
+        _ENVIRONMENT_PATCHES_INSTALLED.add(name)
 
 
 @contextmanager
@@ -87,73 +110,6 @@ def _install_model_build_patches() -> None:
     model_builder.is_model_materialization_deferred = is_model_materialization_deferred
     auto_model._model_init_context = model_init_context
     model_builder._dryrun_compatibility_installed = True
-
-
-def _synthetic_document_boundaries(sequence: Any) -> tuple[int, ...]:
-    """Keep document count while assigning equal spans to value-free inputs."""
-    document_count = max(int(sequence.cu_seq_lens.numel()) - 1, 1)
-    span, remainder = divmod(sequence.global_sequence_length, document_count)
-    boundaries = [0]
-    for index in range(1, document_count + 1):
-        boundaries.append(boundaries[-1] + span + (index <= remainder))
-    return tuple(boundaries)
-
-
-def _install_csa2_patches() -> None:
-    """Make CSA2 host-side validations shape-only under FakeTensor."""
-    from hyper_parallel.components.modules import shared_compressed_dsa_attention as csa2
-
-    sequence_type = csa2.SharedCompressedPackedSequence
-    attention_type = csa2.SharedCompressedDSAAttentionBase
-    if getattr(sequence_type, "_dryrun_compatibility_installed", False):
-        return
-
-    original_document_boundaries = sequence_type.document_boundaries
-    original_local_segment_starts = sequence_type.local_segment_starts
-    original_validate_cp_inputs = attention_type._validate_cp_inputs
-
-    def document_boundaries(sequence: Any) -> tuple[int, ...]:
-        if not hasattr(sequence.cu_seq_lens, "fake_mode"):
-            return original_document_boundaries(sequence)
-        if "boundaries" not in sequence._snapshot:
-            sequence._snapshot["boundaries"] = _synthetic_document_boundaries(sequence)
-        return sequence._snapshot["boundaries"]
-
-    def local_segment_starts(sequence: Any, device: torch.device) -> torch.Tensor:
-        if not hasattr(sequence.cu_seq_lens, "fake_mode"):
-            return original_local_segment_starts(sequence, device)
-        cached = sequence._prepared_starts.get(torch.device(device))
-        if cached is not None:
-            return cached
-        boundaries = torch.tensor(
-            document_boundaries(sequence),
-            dtype=torch.long,
-            device=device,
-        )
-        query_positions = sequence.local_positions(device).squeeze(0)
-        segment_ids = torch.bucketize(query_positions, boundaries[1:], right=True)
-        result = boundaries[:-1].index_select(0, segment_ids).unsqueeze(0)
-        sequence._prepared_starts[torch.device(device)] = result
-        return result
-
-    def validate_cp_inputs(
-            cp_context: Any,
-            position_ids: torch.Tensor,
-            sequence_length: int,
-    ) -> tuple[int, int]:
-        if not hasattr(position_ids, "fake_mode"):
-            return original_validate_cp_inputs(cp_context, position_ids, sequence_length)
-        if cp_context.size <= 1 or not 0 <= cp_context.rank < cp_context.size:
-            raise ValueError(
-                "shared compressed attention CP requires size > 1 and "
-                f"0 <= rank < size, got rank={cp_context.rank}, size={cp_context.size}"
-            )
-        return cp_context.rank * sequence_length, sequence_length * cp_context.size
-
-    sequence_type.document_boundaries = document_boundaries
-    sequence_type.local_segment_starts = local_segment_starts
-    attention_type._validate_cp_inputs = staticmethod(validate_cp_inputs)
-    sequence_type._dryrun_compatibility_installed = True
 
 
 def _install_fake_subgroup_patch() -> None:
@@ -312,9 +268,12 @@ def install_dryrun_compatibility() -> None:
     if _INSTALLED:
         return
     _install_model_build_patches()
-    _install_csa2_patches()
     _install_fake_subgroup_patch()
     _install_muon_metadata_patch()
+    for name, installer in _ENVIRONMENT_PATCHES.items():
+        if name not in _ENVIRONMENT_PATCHES_INSTALLED:
+            installer()
+            _ENVIRONMENT_PATCHES_INSTALLED.add(name)
     _INSTALLED = True
 
 
@@ -322,4 +281,5 @@ __all__ = [
     "install_dryrun_compatibility",
     "is_model_materialization_deferred",
     "model_build_context",
+    "register_environment_patch",
 ]

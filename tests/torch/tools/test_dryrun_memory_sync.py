@@ -53,7 +53,12 @@ _ASSET_ENV = {
 #: The offload/swap scenarios exercise the host-ordered storage lifecycle
 #: (resize_(0) on wait_offload, resize_ + copy on load) through the same
 #: census: a missed release or restore shows up as a device-side count skew.
+#: The baseline runs first so offload/swap scenarios can additionally assert
+#: the device/host trade against it (host ledger has no real counterpart
+#: trace, so it is checked for coverage of the device saving instead).
+_BASELINE = ("baseline", ())
 _SCENARIOS = (
+    _BASELINE,
     ("cp2_ep4_fsdp4", (
         "--accelerator.cp_size=2",
         "--accelerator.ep_size=4",
@@ -67,6 +72,8 @@ _SCENARIOS = (
         "--activation_checkpoint.mode=off",
     )),
 )
+#: Scenarios whose device/host trade is asserted against the baseline.
+_OFFLOAD_SCENARIOS = ("fsdp_cpu_offload", "attention_swap")
 
 
 def _assets() -> dict:
@@ -138,8 +145,14 @@ def test_dryrun_memory_reconciles_with_real_training():
                     "import dryrun_sync_common as c;"
                     "dry = c.load_snapshot(sys.argv[2] + '/rank_0/memory.pickle');"
                     "real = c.latest_snapshot(sys.argv[3]);"
-                    "print(json.dumps(c.reconcile(dry, real)))"
-                ), str(Path(__file__).parent), str(dry_dir), str(real_dir)],
+                    "problems = c.reconcile(dry, real);"
+                    "baseline_dir = sys.argv[4];"
+                    "problems += c.check_offload_trade(dry,"
+                    " c.load_snapshot(baseline_dir + '/rank_0/memory.pickle'))"
+                    " if baseline_dir else [];"
+                    "print(json.dumps(problems))"
+                ), str(Path(__file__).parent), str(dry_dir), str(real_dir),
+                 str(directory / f"dry_{_BASELINE[0]}") if name in _OFFLOAD_SCENARIOS else ""],
                 capture_output=True, text=True, check=True,
             )
             problems = json.loads(report.stdout.strip().splitlines()[-1])

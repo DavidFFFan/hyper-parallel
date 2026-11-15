@@ -629,7 +629,12 @@ class PipelineSwapRuntime:
         afterwards, because the host view now owns the only valid values.
         """
         total_numel = sum(slot.numel for slot in dtype_slots)
-        host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=True)
+        try:
+            host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=True)
+        except RuntimeError:
+            # No live device runtime (logical simulation on a zero-device
+            # host); pinning only affects DMA speed, not the byte account.
+            host_buffer = torch.empty(total_numel, dtype=dtype, device="cpu")
         host_offset = 0
         for slot in dtype_slots:
             flat_view = host_buffer.narrow(0, host_offset, slot.numel)

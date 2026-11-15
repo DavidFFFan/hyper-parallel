@@ -30,7 +30,9 @@ from typing import Any, Optional
 __all__ = [
     "SimulatedEvent",
     "SimulatedStream",
+    "hold_for_simulated_stream",
     "is_device_runtime_simulated",
+    "release_simulated_stream_holds",
     "simulate_device_runtime",
     "simulated_accelerator",
     "simulated_device_handle",
@@ -38,6 +40,7 @@ __all__ = [
 
 _SIMULATED_DEVICE_RUNTIME = False
 _SIMULATED_ACCELERATOR: Optional[str] = None
+_PENDING_STREAM_HOLDS: list = []
 
 
 def simulate_device_runtime(enabled: bool = True, accelerator: Optional[str] = None) -> None:
@@ -53,6 +56,8 @@ def simulate_device_runtime(enabled: bool = True, accelerator: Optional[str] = N
     global _SIMULATED_DEVICE_RUNTIME, _SIMULATED_ACCELERATOR  # pylint: disable=global-statement
     _SIMULATED_DEVICE_RUNTIME = bool(enabled)
     _SIMULATED_ACCELERATOR = accelerator if enabled else None
+    if not enabled:
+        _PENDING_STREAM_HOLDS.clear()
 
 
 def is_device_runtime_simulated() -> bool:
@@ -65,12 +70,33 @@ def simulated_accelerator() -> Optional[str]:
     return _SIMULATED_ACCELERATOR
 
 
+def hold_for_simulated_stream(tensor: Any) -> None:
+    """Keep ``tensor`` alive until the next simulated synchronization point.
+
+    This is the simulation analogue of ``Tensor.record_stream``: a real
+    caching allocator retains a staging buffer until the recorded stream's
+    pending work completes, even after the last Python reference dies. The
+    stand-in holds the reference until an event wait or stream synchronize is
+    observed, so the logical lifetime is conservative (never shorter than the
+    real one) without modeling stream timing.
+    """
+    _PENDING_STREAM_HOLDS.append(tensor)
+
+
+def release_simulated_stream_holds() -> None:
+    """Drop stream-held references; called from simulated waits."""
+    _PENDING_STREAM_HOLDS.clear()
+
+
 class SimulatedEvent:
     """Event stand-in whose completion is always immediate.
 
     Host code that records, waits on, or queries an event observes the same
     control flow as a synchronous device: ``query`` answers ``True`` so
     event-gated reuse (for example pinned-buffer pools) proceeds eagerly.
+    Waits release any stream-held staging references (see
+    :func:`hold_for_simulated_stream`) — the same point a real allocator would
+    be allowed to reclaim them.
     """
 
     def record(self, stream: Optional[Any] = None) -> "SimulatedEvent":
@@ -79,34 +105,39 @@ class SimulatedEvent:
         return self
 
     def wait(self, stream: Optional[Any] = None) -> None:
-        """Accept any stream; nothing is pending."""
+        """Accept any stream; pending stream holds are now reclaimable."""
         del stream
+        release_simulated_stream_holds()
 
     def query(self) -> bool:
         """Report the event as elapsed."""
         return True
 
     def synchronize(self) -> None:
-        """Nothing is pending."""
+        """Pending stream holds are now reclaimable."""
+        release_simulated_stream_holds()
 
 
 class SimulatedStream:
     """Stream stand-in on which every submission completes in program order."""
 
     def synchronize(self) -> None:
-        """Nothing is pending."""
+        """Pending stream holds are now reclaimable."""
+        release_simulated_stream_holds()
 
     def query(self) -> bool:
         """Report the stream as drained."""
         return True
 
     def wait_event(self, event: Any) -> None:
-        """Accept any event; nothing is pending."""
+        """Accept any event; pending stream holds are now reclaimable."""
         del event
+        release_simulated_stream_holds()
 
     def wait_stream(self, stream: Any) -> None:
-        """Accept any stream; nothing is pending."""
+        """Accept any stream; pending stream holds are now reclaimable."""
         del stream
+        release_simulated_stream_holds()
 
     def record_event(self, event: Optional[Any] = None) -> Any:
         """Return an elapsed event."""
@@ -140,8 +171,9 @@ class _SimulatedDeviceHandle:
 
     @staticmethod
     def synchronize(device: Optional[Any] = None) -> None:
-        """Nothing is pending on any simulated device."""
+        """Pending stream holds are now reclaimable."""
         del device
+        release_simulated_stream_holds()
 
 
 _SIMULATED_DEVICE_HANDLE = _SimulatedDeviceHandle()

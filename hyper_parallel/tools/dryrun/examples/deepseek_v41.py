@@ -24,6 +24,7 @@ from torch.utils.checkpoint import checkpoint  # pylint: disable=forbidden-backe
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from hyper_parallel.components.modules.engram import EngramModule
+from hyper_parallel.tools.dryrun.compatibility import register_environment_patch
 from hyper_parallel.tools.dryrun.runtime import (
     ValueDependencyHandler,
     ValueDependencyStage,
@@ -113,7 +114,12 @@ class _DeepSeekV41ValueDependency(ValueDependencyHandler):
     def discover(self, model: Any, context: Any) -> list[str]:
         """Expose one target when the parallelized model contains Engram."""
         del context
-        return ["deepseek_v41"] if any(isinstance(module, EngramModule) for module in model.modules()) else []
+        # The handler registry is process-global; another recipe's model (or
+        # a test double without nn.Module surface) is simply not a target.
+        modules = getattr(model, "modules", None)
+        if not callable(modules):
+            return []
+        return ["deepseek_v41"] if any(isinstance(module, EngramModule) for module in modules()) else []
 
     def install(
             self,
@@ -131,6 +137,82 @@ class _DeepSeekV41ValueDependency(ValueDependencyHandler):
 
 
 register_value_dependency_handler(_DeepSeekV41ValueDependency.name, _DeepSeekV41ValueDependency)
+
+
+def _synthetic_document_boundaries(sequence: Any) -> tuple[int, ...]:
+    """Keep document count while assigning equal spans to value-free inputs."""
+    document_count = max(int(sequence.cu_seq_lens.numel()) - 1, 1)
+    span, remainder = divmod(sequence.global_sequence_length, document_count)
+    boundaries = [0]
+    for index in range(1, document_count + 1):
+        boundaries.append(boundaries[-1] + span + (index <= remainder))
+    return tuple(boundaries)
+
+
+def _install_csa2_patches() -> None:
+    """Make CSA2 host-side validations shape-only under FakeTensor.
+
+    Model-specific environment patch, registered from this example module so
+    the generic dry-run compatibility layer never imports DeepSeek code.
+    """
+    from hyper_parallel.components.modules import (  # pylint: disable=C0415
+        shared_compressed_dsa_attention as csa2,
+    )
+
+    sequence_type = csa2.SharedCompressedPackedSequence
+    attention_type = csa2.SharedCompressedDSAAttentionBase
+    if getattr(sequence_type, "_dryrun_compatibility_installed", False):
+        return
+
+    original_document_boundaries = sequence_type.document_boundaries
+    original_local_segment_starts = sequence_type.local_segment_starts
+    original_validate_cp_inputs = attention_type._validate_cp_inputs  # pylint: disable=protected-access
+
+    def document_boundaries(sequence: Any) -> tuple[int, ...]:
+        if not hasattr(sequence.cu_seq_lens, "fake_mode"):
+            return original_document_boundaries(sequence)
+        if "boundaries" not in sequence._snapshot:  # pylint: disable=protected-access
+            sequence._snapshot["boundaries"] = _synthetic_document_boundaries(sequence)  # pylint: disable=protected-access
+        return sequence._snapshot["boundaries"]  # pylint: disable=protected-access
+
+    def local_segment_starts(sequence: Any, device: torch.device) -> torch.Tensor:
+        if not hasattr(sequence.cu_seq_lens, "fake_mode"):
+            return original_local_segment_starts(sequence, device)
+        cached = sequence._prepared_starts.get(torch.device(device))  # pylint: disable=protected-access
+        if cached is not None:
+            return cached
+        boundaries = torch.tensor(
+            document_boundaries(sequence),
+            dtype=torch.long,
+            device=device,
+        )
+        query_positions = sequence.local_positions(device).squeeze(0)
+        segment_ids = torch.bucketize(query_positions, boundaries[1:], right=True)
+        result = boundaries[:-1].index_select(0, segment_ids).unsqueeze(0)
+        sequence._prepared_starts[torch.device(device)] = result  # pylint: disable=protected-access
+        return result
+
+    def validate_cp_inputs(
+            cp_context: Any,
+            position_ids: torch.Tensor,
+            sequence_length: int,
+    ) -> tuple[int, int]:
+        if not hasattr(position_ids, "fake_mode"):
+            return original_validate_cp_inputs(cp_context, position_ids, sequence_length)
+        if cp_context.size <= 1 or not 0 <= cp_context.rank < cp_context.size:
+            raise ValueError(
+                "shared compressed attention CP requires size > 1 and "
+                f"0 <= rank < size, got rank={cp_context.rank}, size={cp_context.size}"
+            )
+        return cp_context.rank * sequence_length, sequence_length * cp_context.size
+
+    sequence_type.document_boundaries = document_boundaries
+    sequence_type.local_segment_starts = local_segment_starts
+    attention_type._validate_cp_inputs = staticmethod(validate_cp_inputs)  # pylint: disable=protected-access
+    sequence_type._dryrun_compatibility_installed = True  # pylint: disable=protected-access
+
+
+register_environment_patch("deepseek_v41.csa2", _install_csa2_patches)
 
 
 def _bind_chunk_loss(model: Any, chunks: int) -> None:
